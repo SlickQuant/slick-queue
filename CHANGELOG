@@ -1,3 +1,6 @@
+# v1.4.1 - 2026-02-14
+- Remove precompile headers to speed up downstream project build
+
 # v1.4.0 - 2026-02-04
 - **BREAKING CHANGE**: Added last_published_index and header magic in shared memory header
   - Fixed shared-memory attach race by adding an init-state handshake with readiness wait and legacy fallback
