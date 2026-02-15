@@ -1,14 +1,14 @@
 cmake_minimum_required(VERSION 3.10)
 
 project(slick-queue
-        VERSION 1.4.0
+        VERSION 1.4.1
         DESCRIPTION "A C++ Lock-Free MPMC queue"
         LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 
 # Options:
-option(BUILD_SLICK_QUEUE_TESTS "Build tests" ON)
+option(BUILD_SLICK_QUEUE_TESTS "Build tests" ${PROJECT_IS_TOP_LEVEL})
 
 find_package(slick-shm CONFIG QUIET)
 
@@ -44,20 +44,6 @@ target_link_libraries(slick-queue INTERFACE slick::shm)
 if(UNIX AND NOT APPLE)
     target_link_libraries(slick-queue INTERFACE rt atomic)
 endif()
-
-target_precompile_headers(slick-queue INTERFACE 
-    <cstdint>
-    <cstddef>
-    <atomic>
-    <stdexcept>
-    <string>
-    <cassert>
-    <thread>
-    <chrono>
-    <limits>
-    <new>
-)
-
 
 if(BUILD_SLICK_QUEUE_TESTS)
     enable_testing()
