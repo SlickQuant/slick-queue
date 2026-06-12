@@ -685,8 +685,12 @@ private:
             }
         }
     }
-
-
 };
+
+/// Preferred snake_case spelling of SlickQueue, matching the slick::queue
+/// CMake target and the Boost-style naming of companion types such as slick::dynamic_buffer.
+/// SlickQueue remains available for backward compatibility.
+template<typename T>
+using queue = SlickQueue<T>;
 
 }

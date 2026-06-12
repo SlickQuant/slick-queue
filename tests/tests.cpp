@@ -6,14 +6,14 @@
 using namespace slick;
 
 TEST(SlickQueueTests, ReadEmptyQueue) {
-  SlickQueue<int> queue(2);
+  slick::queue<int> queue(2);
   uint64_t read_cursor = 0;
   auto read = queue.read(read_cursor);
   EXPECT_EQ(read.first, nullptr);
 }
 
 TEST(SlickQueueTests, Reserve) {
-  SlickQueue<int> queue(2);
+  slick::queue<int> queue(2);
   auto reserved = queue.reserve();
   EXPECT_EQ(reserved, 0);
   EXPECT_EQ(queue.reserve(), 1);
@@ -21,7 +21,7 @@ TEST(SlickQueueTests, Reserve) {
 }
 
 TEST(SlickQueueTests, ReadShouldFailWithoutPublish) {
-  SlickQueue<int> queue(2);
+  slick::queue<int> queue(2);
   uint64_t read_cursor = 0;
   auto reserved = queue.reserve();
   auto read = queue.read(read_cursor);
@@ -31,19 +31,19 @@ TEST(SlickQueueTests, ReadShouldFailWithoutPublish) {
 
 TEST(SlickQueueTests, InvalidSizeThrows) {
   EXPECT_THROW({
-    SlickQueue<int> queue(3);
+    slick::queue<int> queue(3);
   }, std::invalid_argument);
 }
 
 TEST(SlickQueueTests, ReserveZeroThrows) {
-  SlickQueue<int> queue(2);
+  slick::queue<int> queue(2);
   EXPECT_THROW({
     queue.reserve(0);
   }, std::invalid_argument);
 }
 
 TEST(SlickQueueTests, PublishAndRead) {
-  SlickQueue<int> queue(2);
+  slick::queue<int> queue(2);
   uint64_t read_cursor = 0;
   auto reserved = queue.reserve();
   *queue[reserved] = 5;
@@ -55,7 +55,7 @@ TEST(SlickQueueTests, PublishAndRead) {
 }
 
 TEST(SlickQueueTests, PublishAndReadMultiple) {
-  SlickQueue<int> queue(4);
+  slick::queue<int> queue(4);
   uint64_t read_cursor = 0;
   auto reserved = queue.reserve();
   *queue[reserved] = 5;
@@ -87,7 +87,7 @@ TEST(SlickQueueTests, PublishAndReadMultiple) {
 }
 
 TEST(SlickQueueTests, BufferWrap) {
-  SlickQueue<char> queue(8);
+  slick::queue<char> queue(8);
   uint64_t read_cursor = 0;
 
   auto reserved = queue.reserve(3);
@@ -126,7 +126,7 @@ TEST(SlickQueueTests, BufferWrap) {
 }
 
 TEST(SlickQueueTests, ReadLastUsesLatestReserveSize) {
-  SlickQueue<int> queue(8);
+  slick::queue<int> queue(8);
 
   auto first = queue.reserve(2);
   *queue[first] = 1;
@@ -144,7 +144,7 @@ TEST(SlickQueueTests, ReadLastUsesLatestReserveSize) {
 }
 
 TEST(SlickQueueTests, ReadLastIgnoresUnpublishedReservation) {
-  SlickQueue<int> queue(8);
+  slick::queue<int> queue(8);
 
   auto first = queue.reserve(2);
   *queue[first] = 1;
@@ -161,7 +161,7 @@ TEST(SlickQueueTests, ReadLastIgnoresUnpublishedReservation) {
 }
 
 TEST(SlickQueueTests, ReadLastUsesLatestReserveSizeMultiple) {
-  SlickQueue<char> queue(256);
+  slick::queue<char> queue(256);
 
   const char* first_str = "One";
   uint32_t length = static_cast<uint32_t>(std::strlen(first_str) + 1);
@@ -182,7 +182,7 @@ TEST(SlickQueueTests, ReadLastUsesLatestReserveSizeMultiple) {
 }
 
 TEST(SlickQueueTests, ReadLastIgnoresUnpublishedReservationMultiple) {
-  SlickQueue<char> queue(256);
+  slick::queue<char> queue(256);
 
   const char* first_str = "One";
   uint32_t length = static_cast<uint32_t>(std::strlen(first_str) + 1);
@@ -202,7 +202,7 @@ TEST(SlickQueueTests, ReadLastIgnoresUnpublishedReservationMultiple) {
 }
 
 TEST(SlickQueueTests, LossyOverwriteSkipsOldData) {
-  SlickQueue<int> queue(2);
+  slick::queue<int> queue(2);
   uint64_t read_cursor = 0;
 
   auto s0 = queue.reserve();
@@ -228,7 +228,7 @@ TEST(SlickQueueTests, LossyOverwriteSkipsOldData) {
 
 #if SLICK_QUEUE_ENABLE_LOSS_DETECTION
 TEST(SlickQueueTests, LossDetectionCountsOverrun) {
-  SlickQueue<int> queue(4);
+  slick::queue<int> queue(4);
   for (int i = 0; i < 8; ++i) {
     auto slot = queue.reserve();
     *queue[slot] = i;
@@ -244,7 +244,7 @@ TEST(SlickQueueTests, LossDetectionCountsOverrun) {
 #endif
 
 TEST(SlickQueueTests, AtomicCursorWorkStealing) {
-  SlickQueue<int> queue(1024);
+  slick::queue<int> queue(1024);
   std::atomic<uint64_t> shared_cursor{0};
   std::atomic<int> total_consumed{0};
 

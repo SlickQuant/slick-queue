@@ -2,17 +2,15 @@
 #include <slick/queue.h>
 #include <thread>
 
-using namespace slick;
-
 TEST(ShmTests, ReadEmptyQueue) {
-  SlickQueue<int> queue(2, "sq_read_empty");
+  slick::queue<int> queue(2, "sq_read_empty");
   uint64_t read_cursor = 0;
   auto read = queue.read(read_cursor);
   EXPECT_EQ(read.first, nullptr);
 }
 
 TEST(ShmTests, Reserve) {
-  SlickQueue<int> queue(2, "sq_reserve");
+  slick::queue<int> queue(2, "sq_reserve");
   auto reserved = queue.reserve();
   EXPECT_EQ(reserved, 0);
   EXPECT_EQ(queue.reserve(), 1);
@@ -20,7 +18,7 @@ TEST(ShmTests, Reserve) {
 }
 
 TEST(ShmTests, ReadShouldFailWithoutPublish) {
-  SlickQueue<int> queue(2, "sq_read_fail");
+  slick::queue<int> queue(2, "sq_read_fail");
   uint64_t read_cursor = 0;
   auto reserved = queue.reserve();
   auto read = queue.read(read_cursor);
@@ -29,7 +27,7 @@ TEST(ShmTests, ReadShouldFailWithoutPublish) {
 }
 
 TEST(ShmTests, PublishAndRead) {
-  SlickQueue<int> queue(2, "sq_publish_read");
+  slick::queue<int> queue(2, "sq_publish_read");
   uint64_t read_cursor = 0;
   auto reserved = queue.reserve();
   *queue[reserved] = 5;
@@ -41,7 +39,7 @@ TEST(ShmTests, PublishAndRead) {
 }
 
 TEST(ShmTests, PublishAndReadMultiple) {
-  SlickQueue<int> queue(4, "sq_publish_read_multiple");
+  slick::queue<int> queue(4, "sq_publish_read_multiple");
   uint64_t read_cursor = 0;
   auto reserved = queue.reserve();
   *queue[reserved] = 5;
@@ -73,8 +71,8 @@ TEST(ShmTests, PublishAndReadMultiple) {
 }
 
 TEST(ShmTests, ServerClient) {
-  SlickQueue<int> server(4, "sq_server_cleint");
-  SlickQueue<int> client("sq_server_cleint");
+  slick::queue<int> server(4, "sq_server_cleint");
+  slick::queue<int> client("sq_server_cleint");
   EXPECT_EQ(client.size(), 4);
 
   auto reserved = server.reserve();
@@ -109,9 +107,9 @@ TEST(ShmTests, ServerClient) {
 }
 
 TEST(ShmTests, AtomicCursorWorkStealing) {
-  SlickQueue<int> server(1024, "sq_atomic_cursor_shm");
-  SlickQueue<int> client1("sq_atomic_cursor_shm");
-  SlickQueue<int> client2("sq_atomic_cursor_shm");
+  slick::queue<int> server(1024, "sq_atomic_cursor_shm");
+  slick::queue<int> client1("sq_atomic_cursor_shm");
+  slick::queue<int> client2("sq_atomic_cursor_shm");
 
   std::atomic<uint64_t> shared_cursor{0};
   std::atomic<int> total_consumed{0};
@@ -126,7 +124,7 @@ TEST(ShmTests, AtomicCursorWorkStealing) {
   });
 
   // Multiple clients sharing atomic cursor via shared memory
-  auto consumer = [&](SlickQueue<int>& client) {
+  auto consumer = [&](slick::queue<int>& client) {
     int local_count = 0;
     while (total_consumed.load() < 100) {
       auto result = client.read(shared_cursor);
@@ -151,8 +149,8 @@ TEST(ShmTests, AtomicCursorWorkStealing) {
 }
 
 TEST(ShmTests, LossyOverwriteSkipsOldData) {
-  SlickQueue<int> server(2, "sq_lossy_overwrite");
-  SlickQueue<int> client("sq_lossy_overwrite");
+  slick::queue<int> server(2, "sq_lossy_overwrite");
+  slick::queue<int> client("sq_lossy_overwrite");
 
   auto s0 = server.reserve();
   *server[s0] = 10;
@@ -181,21 +179,21 @@ TEST(ShmTests, LossyOverwriteSkipsOldData) {
 }
 
 TEST(ShmTests, ElementSizeMismatch) {
-  SlickQueue<int> server(4, "sq_element_mismatch");
+  slick::queue<int> server(4, "sq_element_mismatch");
   EXPECT_THROW({
-    SlickQueue<double> client("sq_element_mismatch");
+    slick::queue<double> client("sq_element_mismatch");
   }, std::runtime_error);
 }
 
 TEST(ShmTests, SizeMismatch) {
   // Create a shared memory queue with size 4
-  SlickQueue<int> server(4, "sq_size_mismatch");
+  slick::queue<int> server(4, "sq_size_mismatch");
 
   // Try to create another queue with same name but different size
   // This should throw an exception
   EXPECT_THROW({
     try {
-      SlickQueue<int>(8, "sq_size_mismatch");
+      slick::queue<int> client(8, "sq_size_mismatch");
     } catch (const std::runtime_error& e) {
       EXPECT_TRUE(std::string(e.what()).find("Shared memory size mismatch") != std::string::npos);
       throw;
@@ -204,8 +202,8 @@ TEST(ShmTests, SizeMismatch) {
 }
 
 TEST(ShmTests, ReadLastUsesLatestReserveSize) {
-  SlickQueue<int> queue(8, "sq_read_last");
-  SlickQueue<int> reader_queue(8, "sq_read_last");
+  slick::queue<int> queue(8, "sq_read_last");
+  slick::queue<int> reader_queue(8, "sq_read_last");
 
   auto first = queue.reserve(2);
   *queue[first] = 1;
@@ -223,8 +221,8 @@ TEST(ShmTests, ReadLastUsesLatestReserveSize) {
 }
 
 TEST(ShmTests, ReadLastIgnoresUnpublishedReservation) {
-  SlickQueue<int> queue(8, "sq_read_last2");
-  SlickQueue<int> reader_queue(8, "sq_read_last2");
+  slick::queue<int> queue(8, "sq_read_last2");
+  slick::queue<int> reader_queue(8, "sq_read_last2");
 
   auto first = queue.reserve(2);
   *queue[first] = 1;
@@ -241,8 +239,8 @@ TEST(ShmTests, ReadLastIgnoresUnpublishedReservation) {
 }
 
 TEST(ShmTests, ReadLastUsesLatestReserveSizeMultiple) {
-  SlickQueue<char> queue(256, "sq_read_last_multi");
-  SlickQueue<char> reader_queue(256, "sq_read_last_multi");
+  slick::queue<char> queue(256, "sq_read_last_multi");
+  slick::queue<char> reader_queue(256, "sq_read_last_multi");
 
   const char* first_str = "One";
   uint32_t length = static_cast<uint32_t>(std::strlen(first_str) + 1);
@@ -263,8 +261,8 @@ TEST(ShmTests, ReadLastUsesLatestReserveSizeMultiple) {
 }
 
 TEST(ShmTests, ReadLastIgnoresUnpublishedReservationMultiple) {
-  SlickQueue<char> queue(256, "sq_read_last_multi2");
-  SlickQueue<char> reader_queue(256, "sq_read_last_multi2");
+  slick::queue<char> queue(256, "sq_read_last_multi2");
+  slick::queue<char> reader_queue(256, "sq_read_last_multi2");
 
   const char* first_str = "One";
   uint32_t length = static_cast<uint32_t>(std::strlen(first_str) + 1);

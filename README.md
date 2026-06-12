@@ -68,13 +68,15 @@ target_link_libraries(your_target PRIVATE slick::queue)
 
 ## Usage
 
+> **Note**: `slick::queue<T>` is the preferred name and is used throughout this documentation. It is an alias template for `slick::SlickQueue<T>`, which remains available for backward compatibility.
+
 ### Basic Example
 
 ```cpp
 #include "slick/queue.h"
 
 // Create a queue with 1024 slots (must be power of 2)
-slick::SlickQueue<int> queue(1024);
+slick::queue<int> queue(1024);
 
 // Producer: reserve a slot, write data, and publish
 auto slot = queue.reserve();
@@ -95,13 +97,13 @@ if (result.first != nullptr) {
 #include "slick/queue.h"
 
 // Process 1 (Server/Writer)
-slick::SlickQueue<int> server(1024, "my_queue");
+slick::queue<int> server(1024, "my_queue");
 auto slot = server.reserve();
 *server[slot] = 100;
 server.publish(slot);
 
 // Process 2 (Client/Reader)
-slick::SlickQueue<int> client("my_queue");
+slick::queue<int> client("my_queue");
 uint64_t cursor = 0;
 auto result = client.read(cursor);
 if (result.first != nullptr) {
@@ -115,7 +117,7 @@ if (result.first != nullptr) {
 #include "slick/queue.h"
 #include <thread>
 
-slick::SlickQueue<int> queue(1024);
+slick::queue<int> queue(1024);
 
 // Multiple producers
 auto producer = [&](int id) {
@@ -156,7 +158,7 @@ c1.join(); c2.join();
 #include <thread>
 #include <atomic>
 
-slick::SlickQueue<int> queue(1024);
+slick::queue<int> queue(1024);
 std::atomic<uint64_t> shared_cursor{0};
 
 // Multiple producers
@@ -198,11 +200,11 @@ c1.join(); c2.join();
 
 ```cpp
 // In-process queue
-SlickQueue(uint32_t size);
+queue(uint32_t size);
 
 // Shared memory queue
-SlickQueue(uint32_t size, const char* shm_name);  // Writer/Creator
-SlickQueue(const char* shm_name);                  // Reader/Attacher
+queue(uint32_t size, const char* shm_name);  // Writer/Creator
+queue(const char* shm_name);                  // Reader/Attacher
 ```
 
 ### Core Methods
@@ -219,9 +221,9 @@ SlickQueue(const char* shm_name);                  // Reader/Attacher
 
 ### Important Constraints
 
-**Lock-Free Atomics Implementation**: SlickQueue uses a packed 64-bit atomic internally to guarantee lock-free operations on all platforms. This packs both the write index (48 bits) and the reservation size (16 bits) into a single atomic value.
+**Lock-Free Atomics Implementation**: slick::queue uses a packed 64-bit atomic internally to guarantee lock-free operations on all platforms. This packs both the write index (48 bits) and the reservation size (16 bits) into a single atomic value.
 
-**Lossy Semantics**: SlickQueue does not apply backpressure. If producers advance by at least the queue size before a consumer reads, older entries will be overwritten and the consumer will skip ahead to the latest value for a slot. Size the queue and read frequency to bound loss.
+**Lossy Semantics**: slick::queue does not apply backpressure. If producers advance by at least the queue size before a consumer reads, older entries will be overwritten and the consumer will skip ahead to the latest value for a slot. Size the queue and read frequency to bound loss.
 
 **Debug Loss Detection**: Define `SLICK_QUEUE_ENABLE_LOSS_DETECTION=1` to enable a per-instance skipped-item counter (enabled by default in Debug builds). Use `loss_count()` to inspect how many items were skipped.
 
