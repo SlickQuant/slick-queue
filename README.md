@@ -17,7 +17,7 @@ over shared memory for inter-process communication.
 - **Lock-free operations** for multiple producers and consumers
 - **Header-only implementation** - just include and go
 - **Zero dynamic allocation** on the hot path for predictable performance
-- **Shared memory support** for inter-process communication
+- **Shared memory support** for inter-process communication, backed by [slick-shm](https://github.com/SlickQuant/slick-shm)
 - **Cross-platform** - supports Windows, Linux, and macOS
 - **Modern C++20** implementation
 
@@ -25,14 +25,39 @@ over shared memory for inter-process communication.
 
 - C++20 compatible compiler
 - CMake 3.10+ (for building tests)
+- [slick-shm](https://github.com/SlickQuant/slick-shm) v0.1.5+ - header-only shared memory library used by `slick/queue.h`
+
+`slick/queue.h` includes `<slick/shm/shared_memory.hpp>`, so slick-shm must be available on the
+include path even when the queue is used purely in-process. The vcpkg port and the CMake build both
+resolve this dependency for you; only a manual copy-the-headers installation requires action.
 
 ## Installation
 
-SlickQueue is header-only. Simply add the `include` directory to your project's include path:
+### Header-Only (manual)
+
+SlickQueue is header-only, but so is its slick-shm dependency - copy **both** `include` directories
+into your project and add **both** to your include path:
+
+```
+third_party/
+    slick-queue/include/slick/queue.h
+    slick-shm/include/slick/shm/...
+```
+
+```bash
+g++ -std=c++20 -Ithird_party/slick-queue/include -Ithird_party/slick-shm/include main.cpp
+```
+
+Both libraries install under the same `slick/` prefix, so their `include` directories can also be
+merged into a single tree (`include/slick/queue.h` alongside `include/slick/shm/`) and passed as one
+`-I` path. Then:
 
 ```cpp
 #include "slick/queue.h"
 ```
+
+On Linux, also link `rt`, `pthread`, and `atomic` (`-lrt -lpthread -latomic`); macOS needs only
+`-lpthread` and Windows needs no extra libraries.
 
 ### Using vcpkg
 
@@ -42,12 +67,15 @@ SlickQueue is available in the [vcpkg](https://github.com/microsoft/vcpkg) packa
 vcpkg install slick-queue
 ```
 
-Then in your CMakeLists.txt:
+The port declares `slick-shm` as a dependency, so it is installed automatically. Then in your
+CMakeLists.txt:
 
 ```cmake
 find_package(slick-queue CONFIG REQUIRED)
 target_link_libraries(your_target PRIVATE slick::queue)
 ```
+
+Linking `slick::queue` transitively pulls in `slick::shm` and the platform libraries it needs.
 
 ### Using CMake FetchContent
 
@@ -59,12 +87,17 @@ set(BUILD_SLICK_QUEUE_TESTS OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
     slick-queue
     GIT_REPOSITORY https://github.com/SlickQuant/slick-queue.git
-    GIT_TAG v1.1.0.0  # See https://github.com/SlickQuant/slick-queue/releases for latest version
+    GIT_TAG v1.5.0  # See https://github.com/SlickQuant/slick-queue/releases for latest version
 )
 FetchContent_MakeAvailable(slick-queue)
 
 target_link_libraries(your_target PRIVATE slick::queue)
 ```
+
+slick-queue first looks for an installed slick-shm with `find_package(slick-shm CONFIG)`; if none is
+found it fetches slick-shm itself via FetchContent, so no extra declaration is needed. To pin your
+own version, make `slick::shm` available (installed or declared) before
+`FetchContent_MakeAvailable(slick-queue)`.
 
 ## Usage
 
@@ -250,6 +283,11 @@ queue(const char* shm_name);                  // Reader/Attacher
 cmake -S . -B build
 cmake --build build
 ```
+
+The configure step resolves slick-shm with `find_package(slick-shm CONFIG)` and falls back to
+downloading it with FetchContent, so the first configure needs network access unless slick-shm is
+already installed (for example via vcpkg, using `-DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake`).
+GoogleTest is fetched the same way for the test target.
 
 ### Run Tests
 
