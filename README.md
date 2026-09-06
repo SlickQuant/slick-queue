@@ -25,9 +25,9 @@ over shared memory for inter-process communication.
 
 - C++20 compatible compiler
 - CMake 3.10+ (for building tests)
-- [slick-shm](https://github.com/SlickQuant/slick-shm) v0.1.5+ - header-only shared memory library used by `slick/queue.h`
+- [slick-shm](https://github.com/SlickQuant/slick-shm) v0.1.5+ - header-only shared memory library used by `slick/queue.hpp`
 
-`slick/queue.h` includes `<slick/shm/shared_memory.hpp>`, so slick-shm must be available on the
+`slick/queue.hpp` includes `<slick/shm/shared_memory.hpp>`, so slick-shm must be available on the
 include path even when the queue is used purely in-process. The vcpkg port and the CMake build both
 resolve this dependency for you; only a manual copy-the-headers installation requires action.
 
@@ -40,7 +40,7 @@ into your project and add **both** to your include path:
 
 ```
 third_party/
-    slick-queue/include/slick/queue.h
+    slick-queue/include/slick/queue.hpp
     slick-shm/include/slick/shm/...
 ```
 
@@ -49,11 +49,11 @@ g++ -std=c++20 -Ithird_party/slick-queue/include -Ithird_party/slick-shm/include
 ```
 
 Both libraries install under the same `slick/` prefix, so their `include` directories can also be
-merged into a single tree (`include/slick/queue.h` alongside `include/slick/shm/`) and passed as one
+merged into a single tree (`include/slick/queue.hpp` alongside `include/slick/shm/`) and passed as one
 `-I` path. Then:
 
 ```cpp
-#include "slick/queue.h"
+#include "slick/queue.hpp"
 ```
 
 On Linux, also link `rt`, `pthread`, and `atomic` (`-lrt -lpthread -latomic`); macOS needs only
@@ -106,7 +106,7 @@ own version, make `slick::shm` available (installed or declared) before
 ### Basic Example
 
 ```cpp
-#include "slick/queue.h"
+#include "slick/queue.hpp"
 
 // Create a queue with 1024 slots (must be power of 2)
 slick::queue<int> queue(1024);
@@ -127,7 +127,7 @@ if (result.first != nullptr) {
 ### Shared Memory Example (IPC)
 
 ```cpp
-#include "slick/queue.h"
+#include "slick/queue.hpp"
 
 // Process 1 (Server/Writer)
 slick::queue<int> server(1024, "my_queue");
@@ -147,7 +147,7 @@ if (result.first != nullptr) {
 ### Multi-Producer Multi-Consumer
 
 ```cpp
-#include "slick/queue.h"
+#include "slick/queue.hpp"
 #include <thread>
 
 slick::queue<int> queue(1024);
@@ -187,7 +187,7 @@ c1.join(); c2.join();
 ### Work-Stealing with Shared Atomic Cursor
 
 ```cpp
-#include "slick/queue.h"
+#include "slick/queue.hpp"
 #include <thread>
 #include <atomic>
 

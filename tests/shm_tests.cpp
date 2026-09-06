@@ -1,5 +1,5 @@
 #include <gtest/gtest.h>
-#include <slick/queue.h>
+#include <slick/queue.hpp>
 #include <stdexcept>
 #include <string>
 #include <thread>

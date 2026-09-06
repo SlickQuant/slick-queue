@@ -1,6 +1,6 @@
 #pragma once
 
-#include <slick/queue.h>
+#include <slick/queue.hpp>
 
 // Feature configuration is a template parameter, so one test binary can cover every
 // combination. Each traits type below pins the features a group of tests needs, instead
