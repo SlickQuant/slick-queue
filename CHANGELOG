@@ -1,3 +1,44 @@
+# v2.0.0 - 2026-09-05
+
+## Feature configuration moved from macros to a traits template parameter
+- `SlickQueue` (and the `slick::queue` alias) take a second parameter: `template<typename T, queue_traits_type Traits = default_queue_traits>`. Derive from `slick::queue_traits` and override `enable_read_last`, `enable_reset_check`, `enable_loss_detection`, or `enable_cpu_relax`
+- **Breaking**: the `SLICK_QUEUE_ENABLE_LOSS_DETECTION`, and `SLICK_QUEUE_ENABLE_CPU_RELAX` are removed. Defining one now emits a compiler warning and has no effect; move the setting into a traits struct
+- Source compatible for normal use: `slick::queue<T>`, `slick::SlickQueue<T>`, and every member call are unchanged, because `Traits` defaults to `default_queue_traits`
+- **Breaking**: a hand-written forward declaration such as `namespace slick { template<typename T> class SlickQueue; }` no longer compiles (MSVC `C2977`; matching the arity but leaving `Traits` unconstrained gives `C3855`). A declaration must match the arity *and* the concept constraint before any default argument applies, and the constraint cannot be named without the header - so remove the forward declaration and `#include <slick/queue.h>` instead
+- Differently configured queues are now different types, so they can coexist in one program and mismatched translation units fail to link instead of silently violating the ODR. `default_queue_traits` still selects loss detection by `NDEBUG`, so Debug and Release keep their previous behaviour
+- `read_last()` requires `Traits::enable_read_last`; calling it otherwise is a `static_assert` rather than a silent fall back to the legacy reserved-cursor heuristic
+- **Breaking**: `enable_read_last` is now part of the shared-memory contract. The header magic carries a feature nibble - `'SLQ1'` when the segment's last-published index is maintained and `'SLQ0'` when it is not - and every attacher matches it against its own configuration, throwing `std::runtime_error` on a mismatch instead of degrading silently. The remaining traits are process-local and still mix freely on one segment
+- **Breaking**: shared-memory segments created before v1.4.0 carry no layout marker and are now rejected at attach time (with a message naming the version), rather than being served by the reserved-cursor fallback; `read_last()`'s legacy branch is gone with it
+- Optional counter layout is unchanged: a feature that is on occupies exactly the offsets its macro-guarded member did, and one that is off takes no space (the read-only flags did move, see Performance)
+- The `queue_traits_type` concept rejects a malformed traits type at the point of use
+
+## Fixes
+- Fixed `read_last()` reading out of bounds in the control slot array once the published index exceeded the queue capacity (index is now masked with `size - 1`)
+- Fixed `read_last()` returning a `{pointer, size}` pair that could describe two different records; the slot is now validated against the last published index before and after reading its size
+- Fixed both `read()` overloads reading `slot.size` twice, unvalidated - once to advance the cursor and once to build the returned pair. A producer recycling the slot between the two loads left the cursor describing a different record than the caller was handed; in the shared-cursor overload the two loads straddle the claiming CAS, so the cursor could be advanced by one record's size while another's was returned. Both now load the size once and re-validate the slot before committing, as `read_last()` does
+- `slot::size` is `std::atomic<uint32_t>` rather than a plain `uint32_t`. A wrapping producer recycles a slot while a reader is inside the seqlock bracket around it, which made the plain field a data race - and the acquire fence the readers use orders atomic accesses only, so the bracket did not in fact bound the read. A relaxed 32-bit load or store is the same instruction as the plain access on every supported target, and `sizeof(slot)` is unchanged, so neither the hot path nor the shared-memory layout moves. Both properties are now pinned by `static_assert`
+- `read(uint64_t&)` charges the loss counter when the read commits instead of when the overrun is spotted, matching `read(std::atomic<uint64_t>&)`. Without this the retry above could count one overrun twice, since that path does not advance the cursor
+- Fixed reset detection never firing for the case it exists to handle. It compared the *slot's* index against the reservation counter, but `reset()` clears the control array before rewinding the counter, so a stale reader always lands on a slot holding either an invalid index or a fresh low one - neither ahead of the counter. The reader kept returning `nullptr` with its old cursor intact and then skipped the start of the new generation. The test is now on the reader's cursor: a cursor beyond the reservation counter is asking for an index that was never reserved, which can only mean the counter was rewound
+- Fixed the reset-detection branch in `read(std::atomic<uint64_t>&)` overwriting a shared cursor with a blind store, discarding progress made by other consumers; it now rewinds via compare-exchange
+- Both reset-detection branches now share a single `was_reset()` helper, evaluated before the slot load since it no longer depends on the slot
+- Fixed the reverse of the mismatch the layout marker used to catch: an attacher with `enable_read_last` off never advanced the shared index, silently freezing `read_last()` for every peer that did maintain it. Nothing detected this, because the marker was only consulted by queues that had the feature on. Both directions are now rejected at attach time
+- `reset()` no longer needs to guard the last-published header word, since a segment that reaches it is guaranteed to maintain one
+
+## Performance
+- Readers no longer load the producer's reservation counter on every `read()`; reset detection is opt-in via `enable_reset_check` (default off) because `reset()` is documented as not thread-safe
+- Per-publish `read_last()` index tracking is optional via `enable_read_last` (default on), which also drops its cacheline-aligned counter from the object
+- `publish()` and `read_last()` dropped the `last_published_valid_` test they carried on every call. Validating the segment's feature nibble once at attach time makes the flag redundant: a queue that reaches those paths is guaranteed to have a maintained index. The flag is gone from the object entirely
+- The flags that are read-only after construction (`own_`, `use_shm_`) moved from the tail of the object into the first cacheline, beside `size_`, `mask_` and the pointers, where a producer CAS on the trailing atomics cannot invalidate the line that holds them. They fit in padding the first cacheline already carried ahead of `reserved_local_`'s `alignas`, so `sizeof` is unchanged in every configuration
+
+## Tests
+- Added `reset()` coverage (local and shared memory, both `read()` overloads) and wrap-around regression tests for `read_last()`
+- Added a wrapping-producer test that pins the cursor/size invariant `read()` broke: the record's index, which is the cursor after the call minus the size returned, must map back to the slot the cursor selected. Publish sizes cycle 1,1,2 and sum to 4, dividing the 16-slot queue exactly, so `reserve()` never takes its mid-buffer wrap path and any mismatch is the bug rather than a skipped cursor. It asserts a non-zero loss count so a run that quietly kept up cannot pass as coverage
+- Stale-cursor tests now assert that a reader actually rewinds onto the new generation, including when the queue is empty after `reset()`; they fail against the previous slot-based predicate
+- Added mixed-traits tests: two differently configured queues in one program, a creator/attacher pair whose traits differ only in process-local features, and both directions of an `enable_read_last` mismatch on one segment (asserting the thrown message, so they cannot pass on an unrelated attach failure)
+- Added `static_assert`s pinning the object layout so a future change cannot silently reintroduce a dead cacheline
+- The suite is a single binary again - it instantiates every configuration it needs rather than being built once per macro setting - and the loss-detection tests no longer depend on the build type
+- The shared-memory `read_last()` wrap test now attaches with the reader constructor, exercising the header-derived mask
+
 # v1.5.0 - 2026-06-12
 - Added `slick::queue<T>` alias template as the preferred snake_case spelling of `slick::SlickQueue<T>`, matching the `slick::queue` CMake target; `SlickQueue` remains available for backward compatibility
 - Updated README examples and tests to use the `slick::queue` alias

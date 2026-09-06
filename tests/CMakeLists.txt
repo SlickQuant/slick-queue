@@ -19,8 +19,8 @@ endif()
 
 target_link_libraries(slick-queue-tests PRIVATE slick::queue GTest::gtest_main)
 
-# Enable loss detection in tests
-target_compile_definitions(slick-queue-tests PRIVATE SLICK_QUEUE_ENABLE_LOSS_DETECTION=1)
+# No compile definitions: feature configuration is a template parameter now, so a single
+# binary instantiates every configuration it needs (see test_traits.h).
 
 include(GoogleTest)
 gtest_discover_tests(slick-queue-tests)

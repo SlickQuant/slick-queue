@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.10)
 
 project(slick-queue
-        VERSION 1.5.0
+        VERSION 2.0.0
         DESCRIPTION "A C++ Lock-Free MPMC queue"
         LANGUAGES CXX)
 
@@ -21,7 +21,7 @@ if (NOT slick-shm_FOUND)
     FetchContent_Declare(
         slick-shm
         GIT_REPOSITORY https://github.com/SlickQuant/slick-shm.git
-        GIT_TAG v0.1.5
+        GIT_TAG v0.1.6
     )
     FetchContent_MakeAvailable(slick-shm)
 else()
