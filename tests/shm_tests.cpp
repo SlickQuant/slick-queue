@@ -3,6 +3,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <cstring>
 
 #include "test_traits.h"
 
@@ -273,13 +274,13 @@ TEST(ShmTests, ReadLastUsesLatestReserveSizeMultiple) {
   const char* first_str = "One";
   uint32_t length = static_cast<uint32_t>(std::strlen(first_str) + 1);
   auto first = queue.reserve(length);
-  std::strcpy(queue[first], first_str);
+  std::memcpy(queue[first], first_str, length);
   queue.publish(first, length);
 
   const char* last_str = "Four";
-  length = static_cast<uint32_t>(strlen(first_str) + 1);
+  length = static_cast<uint32_t>(std::strlen(last_str) + 1);
   auto last = queue.reserve(length);
-  std::strcpy(queue[last], last_str);
+  std::memcpy(queue[last], last_str, length);
   queue.publish(last, length);
 
   auto [latest, size] = reader_queue.read_last();
@@ -295,13 +296,13 @@ TEST(ShmTests, ReadLastIgnoresUnpublishedReservationMultiple) {
   const char* first_str = "One";
   uint32_t length = static_cast<uint32_t>(std::strlen(first_str) + 1);
   auto first = queue.reserve(length);
-  std::strcpy(queue[first], first_str);
+  std::memcpy(queue[first], first_str, length);
   queue.publish(first, length);
 
   const char* last_str = "Four";
-  length = static_cast<uint32_t>(strlen(first_str) + 1);
+  length = static_cast<uint32_t>(std::strlen(last_str) + 1);
   auto last = queue.reserve(length);
-  std::strcpy(queue[last], last_str);
+  std::memcpy(queue[last], last_str, length);
 
   auto [latest, size] = reader_queue.read_last();
   ASSERT_NE(latest, nullptr);

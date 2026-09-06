@@ -13,9 +13,6 @@ if(NOT GTest_FOUND)
 endif()
 
 add_executable(slick-queue-tests tests.cpp shm_tests.cpp)
-if(MSVC)
-  add_compile_options(/wd4996)
-endif()
 
 target_link_libraries(slick-queue-tests PRIVATE slick::queue GTest::gtest_main)
 
