@@ -25,7 +25,7 @@ if (NOT slick-shm_FOUND)
     )
     FetchContent_MakeAvailable(slick-shm)
 else()
-    message(STATUS "slick-shm: ${slick-shm_VERSION}")
+    message(STATUS "Found slick-shm ${slick-shm_VERSION}: ${slick-shm_DIR}")
 endif()
 
 add_library(slick-queue INTERFACE)
