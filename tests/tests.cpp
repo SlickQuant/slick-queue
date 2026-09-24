@@ -579,6 +579,249 @@ TEST(SlickQueueTests, AtomicCursorReadAfterReset) {
 }
 
 // ---------------------------------------------------------------------------
+// items_per_slot: one control slot covering several items
+// ---------------------------------------------------------------------------
+
+TEST(SlickQueueItemsPerSlotTests, DefaultIsOne) {
+  slick::queue<int> queue(1024);
+  EXPECT_EQ(queue.items_per_slot(), 1u);
+  EXPECT_EQ(queue.slot_count(), 1024u);
+}
+
+TEST(SlickQueueItemsPerSlotTests, ShrinksControlArray) {
+  // The point of the feature: a byte buffer no longer carries a 16-byte slot per byte.
+  slick::queue<char> queue(4096, 64);
+  EXPECT_EQ(queue.size(), 4096u);
+  EXPECT_EQ(queue.items_per_slot(), 64u);
+  EXPECT_EQ(queue.slot_count(), 64u);
+}
+
+TEST(SlickQueueItemsPerSlotTests, RejectsBadArguments) {
+  EXPECT_THROW({ slick::queue<char> queue(64, 3); }, std::invalid_argument);
+  // Through a variable: a literal 0 is a null pointer constant and selects the
+  // (size, shm_name) overload instead - see LiteralZeroStillMeansNoShmName.
+  const uint32_t zero = 0;
+  EXPECT_THROW({ slick::queue<char> queue(64, zero); }, std::invalid_argument);
+  EXPECT_THROW({ slick::queue<char> queue(64, 128); }, std::invalid_argument);
+  EXPECT_NO_THROW({ slick::queue<char> queue(64, 64); });
+}
+
+TEST(SlickQueueItemsPerSlotTests, LiteralZeroStillMeansNoShmName) {
+  // Regression: adding the (size, items_per_slot) overload made queue(size, 0) - and
+  // queue(size, NULL), NULL being 0 on MSVC - ambiguous, breaking code that compiled
+  // before. A literal 0 must keep meaning "no shared-memory name".
+  slick::queue<int> zero(8, 0);
+  EXPECT_FALSE(zero.use_shm());
+  EXPECT_EQ(zero.items_per_slot(), 1u);
+
+  slick::queue<int> null(8, NULL);
+  EXPECT_FALSE(null.use_shm());
+  EXPECT_EQ(null.items_per_slot(), 1u);
+
+  // Any other integer still reaches the items_per_slot overload.
+  slick::queue<int> unit(8, 4);
+  EXPECT_EQ(unit.items_per_slot(), 4u);
+  const uint32_t runtime_value = 2;
+  slick::queue<int> from_variable(8, runtime_value);
+  EXPECT_EQ(from_variable.items_per_slot(), 2u);
+}
+
+TEST(SlickQueueItemsPerSlotTests, RoundsReservations) {
+  // items_per_slot is the minimum a reservation consumes: anything up to 16 takes 16,
+  // and a larger one takes whole multiples of it. Every index is therefore a multiple of 16.
+  slick::queue<char> queue(64, 16);
+  EXPECT_EQ(queue.reserve(3), 0u);
+  EXPECT_EQ(queue.reserve(3), 16u);
+  EXPECT_EQ(queue.reserve(20), 32u);   // two units
+  EXPECT_EQ(queue.reserve(1), 64u);
+  EXPECT_EQ(queue.reserve(16), 80u);   // exactly one unit takes the fast path too
+}
+
+TEST(SlickQueueItemsPerSlotTests, ReadAdvancesByUnit) {
+  // read() hands back the published size but moves the cursor by what reserve() consumed,
+  // so reader and producer stay in lockstep message after message.
+  slick::queue<char> queue(64, 16);
+  const char* messages[] = {"abc", "de", "fghij"};
+  for (const char* m : messages) {
+    auto n = static_cast<uint32_t>(std::strlen(m));
+    auto index = queue.reserve(n);
+    std::memcpy(queue[index], m, n);
+    queue.publish(index, n);
+  }
+
+  uint64_t cursor = 0;
+  for (const char* m : messages) {
+    const uint64_t before = cursor;
+    auto [data, n] = queue.read(cursor);
+    ASSERT_NE(data, nullptr);
+    EXPECT_EQ(n, std::strlen(m));
+    EXPECT_EQ(std::string(data, n), m);
+    EXPECT_EQ(cursor, before + 16);
+  }
+  EXPECT_EQ(queue.read(cursor).first, nullptr);
+  EXPECT_EQ(cursor, 48u);
+}
+
+TEST(SlickQueueItemsPerSlotTests, MultiUnitMessage) {
+  // A message larger than the minimum spans several units under one control slot; the
+  // units it covers are skipped as a whole rather than read as separate records.
+  slick::queue<char> queue(128, 16);
+  std::string big(40, 'x');
+  for (size_t i = 0; i < big.size(); ++i) big[i] = static_cast<char>('a' + i % 26);
+
+  auto first = queue.reserve(static_cast<uint32_t>(big.size()));
+  std::memcpy(queue[first], big.data(), big.size());
+  queue.publish(first, static_cast<uint32_t>(big.size()));
+
+  auto second = queue.reserve(2);
+  EXPECT_EQ(second, 48u);
+  std::memcpy(queue[second], "ok", 2);
+  queue.publish(second, 2);
+
+  uint64_t cursor = 0;
+  auto [data, n] = queue.read(cursor);
+  ASSERT_NE(data, nullptr);
+  EXPECT_EQ(std::string(data, n), big);
+  EXPECT_EQ(cursor, 48u);
+
+  auto [data2, n2] = queue.read(cursor);
+  ASSERT_NE(data2, nullptr);
+  EXPECT_EQ(std::string(data2, n2), "ok");
+  EXPECT_EQ(cursor, 64u);
+}
+
+TEST(SlickQueueItemsPerSlotTests, BufferWrap) {
+  // The shape of SlickQueueTests.BufferWrap with a unit of 16: a reservation that cannot
+  // fit in the tail leaves its wrap marker in the tail's control slot, and the reader
+  // follows it to the start of the ring.
+  slick::queue<char> queue(64, 16);
+  uint64_t cursor = 0;
+  for (int i = 0; i < 3; ++i) {
+    auto index = queue.reserve(16);
+    std::memset(queue[index], '0' + i, 16);
+    queue.publish(index, 16);
+    ASSERT_NE(queue.read(cursor).first, nullptr);
+  }
+  ASSERT_EQ(cursor, 48u);
+
+  auto wrapped = queue.reserve(20);   // needs 32, only 16 left in the tail
+  EXPECT_EQ(wrapped, 64u);
+  std::memcpy(queue[wrapped], "wrapped-message-0123", 20);
+
+  // Before publish the reader follows the marker but finds nothing yet.
+  auto read = queue.read(cursor);
+  EXPECT_EQ(read.first, nullptr);
+  EXPECT_EQ(cursor, 64u);
+
+  queue.publish(wrapped, 20);
+  read = queue.read(cursor);
+  ASSERT_NE(read.first, nullptr);
+  EXPECT_EQ(read.second, 20u);
+  EXPECT_EQ(std::string(read.first, read.second), "wrapped-message-0123");
+  EXPECT_EQ(cursor, 96u);
+}
+
+TEST(SlickQueueItemsPerSlotTests, AtomicCursorAdvancesByUnit) {
+  slick::queue<char> queue(64, 8);
+  std::atomic<uint64_t> cursor{0};
+  for (uint32_t n : {3u, 9u, 1u}) {
+    auto index = queue.reserve(n);
+    std::memset(queue[index], 'a', n);
+    queue.publish(index, n);
+  }
+  EXPECT_EQ(queue.read(cursor).second, 3u);
+  EXPECT_EQ(cursor.load(), 8u);
+  EXPECT_EQ(queue.read(cursor).second, 9u);
+  EXPECT_EQ(cursor.load(), 24u);
+  EXPECT_EQ(queue.read(cursor).second, 1u);
+  EXPECT_EQ(cursor.load(), 32u);
+  EXPECT_EQ(queue.read(cursor).first, nullptr);
+}
+
+TEST(SlickQueueItemsPerSlotTests, ReadLastAfterWrap) {
+  slick::queue<int> queue(16, 4);
+  for (int i = 0; i < 10; ++i) {
+    auto index = queue.reserve(3);
+    for (int k = 0; k < 3; ++k) {
+      *queue[index + k] = i * 10 + k;
+    }
+    queue.publish(index, 3);
+  }
+  auto [latest, size] = queue.read_last();
+  ASSERT_NE(latest, nullptr);
+  EXPECT_EQ(size, 3u);
+  EXPECT_EQ(latest[0], 90);
+  EXPECT_EQ(latest[2], 92);
+}
+
+TEST(SlickQueueItemsPerSlotTests, ResetKeepsUnit) {
+  slick::queue<char> queue(64, 16);
+  for (int i = 0; i < 6; ++i) {
+    auto index = queue.reserve(5);
+    queue.publish(index, 5);
+  }
+  queue.reset();
+  EXPECT_EQ(queue.items_per_slot(), 16u);
+  EXPECT_EQ(queue.reserve(5), 0u);
+  EXPECT_EQ(queue.reserve(5), 16u);
+}
+
+TEST(SlickQueueItemsPerSlotTests, WrappingProducerKeepsCursorAndSizeConsistent) {
+  // SlickQueueTests.WrappingProducerKeepsCursorAndSizeConsistent with a unit of 4. The
+  // published sizes 1,3,5 have footprints 4,4,8 summing to 16, which divides the ring, so
+  // reserve() never takes its mid-buffer wrap path and any slot mismatch is the bug.
+  constexpr uint32_t kSize = 64;
+  constexpr uint32_t kUnit = 4;
+  constexpr uint64_t kMask = kSize - 1;
+  constexpr uint32_t kPattern[] = {1, 3, 5};
+  auto footprint = [](uint32_t n) { return (n + kUnit - 1) & ~(kUnit - 1); };
+
+  slick::queue<int, loss_traits> queue(kSize, kUnit);
+  std::atomic<bool> stop{false};
+
+  std::thread producer([&]() {
+    for (uint64_t i = 0; !stop.load(std::memory_order_relaxed); ++i) {
+      uint32_t n = kPattern[i % 3];
+      auto index = queue.reserve(n);
+      for (uint32_t k = 0; k < n; ++k) {
+        *queue[index + k] = static_cast<int>(n);
+      }
+      queue.publish(index, n);
+    }
+  });
+
+  uint64_t cursor = 0;
+  int reads = 0;
+  std::string failure;
+  for (int spins = 0; spins < 2000000 && reads < 200000 && failure.empty(); ++spins) {
+    const uint64_t before = cursor;
+    auto [data, n] = queue.read(cursor);
+    if (data == nullptr) {
+      continue;
+    }
+    ++reads;
+    if (n != 1 && n != 3 && n != 5) {
+      failure = "returned size " + std::to_string(n) + " was never published";
+    } else if (cursor % kUnit != 0) {
+      failure = "cursor " + std::to_string(cursor) + " is not a multiple of the unit";
+    } else if (cursor < before + footprint(n)) {
+      failure = "cursor " + std::to_string(cursor) + " did not advance past " +
+                std::to_string(before) + " by footprint " + std::to_string(footprint(n));
+    } else if (((cursor - footprint(n)) & kMask) != (before & kMask)) {
+      failure = "cursor advanced by other than the footprint of size " + std::to_string(n);
+    }
+  }
+
+  stop.store(true, std::memory_order_relaxed);
+  producer.join();
+
+  EXPECT_TRUE(failure.empty()) << failure;
+  EXPECT_GT(reads, 0);
+  EXPECT_GT(queue.loss_count(), 0u)
+      << "the producer never lapped the reader, so the invariant was never stressed";
+}
+
+// ---------------------------------------------------------------------------
 // Traits configuration
 // ---------------------------------------------------------------------------
 

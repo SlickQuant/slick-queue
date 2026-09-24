@@ -227,6 +227,42 @@ c1.join(); c2.join();
 // Total items consumed: 200 (each item consumed exactly once)
 ```
 
+### Byte Buffers and Control-Array Memory
+
+Every reservation is tracked by a 16-byte control slot. By default there is one per item, which
+is negligible for large `T` but dominates for a byte buffer: `slick::queue<char>(16M)` needs
+16 MB of data and 256 MB of control slots.
+
+Pass `items_per_slot` to fix that. **`items_per_slot` is the minimum number of items a single
+`reserve()` consumes.** Any `reserve(n)` with `n <= items_per_slot` takes exactly one unit of
+`items_per_slot` items; a larger one takes `ceil(n / items_per_slot)` units. One control slot
+covers one unit, so the control array shrinks to `size / items_per_slot` slots.
+
+```cpp
+// 16M byte buffer, minimum 64 bytes per reservation:
+// 16 MB data + 4 MB control, instead of 16 MB + 256 MB
+slick::queue<char> buf(16u << 20, 64);
+
+auto i = buf.reserve(3);    // consumes 64 items (the minimum); i is a multiple of 64
+std::memcpy(buf[i], "abc", 3);
+buf.publish(i, 3);
+
+auto j = buf.reserve(200);  // consumes 256 items (4 units), still one control slot
+// ... write 200 bytes at buf[j], then
+buf.publish(j, 200);
+
+uint64_t cursor = 0;
+auto [data, n] = buf.read(cursor);  // n == 3, cursor == 64
+```
+
+`read()` returns the size you published, while the cursor advances by the whole units the
+reservation consumed. The trade-off is that a message smaller than `items_per_slot` still costs a
+full unit, so the queue holds at most `size / items_per_slot` messages - choose it to match your
+typical message size, not your largest. Both values must be powers of two, with
+`items_per_slot <= size`.
+
+As always, `publish()` should be given the same `n` as the matching `reserve()`.
+
 ## API Overview
 
 ### Constructor
@@ -234,21 +270,37 @@ c1.join(); c2.join();
 ```cpp
 // In-process queue
 queue(uint32_t size);
+queue(uint32_t size, uint32_t items_per_slot);
 
 // Shared memory queue
-queue(uint32_t size, const char* shm_name);  // Writer/Creator
-queue(const char* shm_name);                  // Reader/Attacher
+queue(uint32_t size, const char* shm_name);                           // Writer/Creator
+queue(uint32_t size, uint32_t items_per_slot, const char* shm_name);  // Writer/Creator
+queue(const char* shm_name);                                          // Reader/Attacher
 ```
+
+`items_per_slot` defaults to 1. It is recorded in the shared-memory header: the attacher
+constructor adopts it, just as it adopts `size`, and a creator constructor that opens an existing
+segment with a different value throws `std::runtime_error`. Segments created before this field
+existed read as `items_per_slot = 1`.
+
+When `items_per_slot` is not 1, the creator also sets bit 1 of the layout marker (`'SLQ3'`, or
+`'SLQ2'` without `enable_read_last`). Versions 2.0.0 and earlier do not know this field and would index
+the control array one slot per item, but they reject any marker bit they do not recognise - so
+they fail loudly at attach time with *"created with unknown layout features"* instead of
+misreading the segment. A segment with the default `items_per_slot = 1` keeps `'SLQ1'`/`'SLQ0'`
+and remains fully compatible with older peers.
 
 ### Core Methods
 
-- `uint64_t reserve(uint32_t n = 1)` - Reserve `n` slots for writing (non-blocking; may overwrite old data if consumers lag)
+- `uint64_t reserve(uint32_t n = 1)` - Reserve `n` slots for writing (non-blocking; may overwrite old data if consumers lag). `n` is rounded up to a multiple of `items_per_slot()`
 - `T* operator[](uint64_t slot)` - Access reserved slot
 - `void publish(uint64_t slot, uint32_t n = 1)` - Publish `n` written items to consumers
 - `std::pair<T*, uint32_t> read(uint64_t& cursor)` - Read next available item (independent cursor)
 - `std::pair<T*, uint32_t> read(std::atomic<uint64_t>& cursor)` - Read next available item (shared atomic cursor for work-stealing)
 - `std::pair<T*, uint32_t> read_last()` - Read the most recently published item without a cursor
 - `uint32_t size()` - Get queue capacity
+- `uint32_t items_per_slot()` - Get the minimum number of items a single `reserve()` consumes
+- `uint32_t slot_count()` - Get the number of control slots, `size() / items_per_slot()`
 - `uint64_t loss_count() const` - Get count of skipped items due to overwrite (0 when the feature is off)
 - `void reset()` - Reset the queue, invalidating all existing data
 

@@ -191,6 +191,19 @@ struct loss_counter_storage {
 template<>
 struct loss_counter_storage<false> {};
 
+// Parameter type of the items_per_slot constructor. It exists only for overload
+// resolution: queue(size, 0) and queue(size, NULL) predate that constructor and mean "no
+// shared-memory name", and a literal 0 is a null pointer constant, so with a plain
+// uint32_t parameter the call would be ambiguous. Reaching this type takes a user-defined
+// conversion, which ranks below the standard 0 -> const char* conversion, so those calls
+// keep selecting the (size, shm_name) overload. Any other integer, which is not a null
+// pointer constant, has only this overload to go to. Implicit on purpose - callers write
+// queue(size, 64), never this type.
+struct items_per_slot_arg {
+    items_per_slot_arg(uint32_t v) noexcept : value(v) {}  // NOLINT(google-explicit-constructor)
+    uint32_t value;
+};
+
 }  // namespace detail
 
 /**
@@ -245,6 +258,14 @@ class SlickQueue {
 
     uint32_t size_;
     uint32_t mask_;
+    // One control slot covers items_per_slot_ data items: the minimum a single reserve()
+    // consumes. Every reservation index is a multiple of it (reserve() only ever advances
+    // the counter by a multiple of it, and size_ is one too), so (index & mask_) >>
+    // slot_shift_ maps each reservation to its own slot. Read-only after construction,
+    // and in this line for the same reason as own_/use_shm_ below.
+    uint32_t items_per_slot_ = 1;
+    uint32_t item_mask_ = 0;          // items_per_slot_ - 1
+    uint32_t slot_shift_ = 0;         // log2(items_per_slot_)
     T* data_ = nullptr;
     slot* control_ = nullptr;
     std::atomic<reserved_info>* reserved_ = nullptr;
@@ -285,12 +306,15 @@ class SlickQueue {
     //   Offset 12-15 (4 bytes):  element_size - sizeof(T) for validation (uint32_t)
     //   Offset 16-23 (8 bytes):  std::atomic<uint64_t> - last published index
     //   Offset 24-27 (4 bytes):  header_magic - 'SLQ' layout marker + feature nibble
-    //   Offset 28-47 (20 bytes): PADDING - reserved for future use
+    //   Offset 28-31 (4 bytes):  items_per_slot - data items per control slot (0 reads as 1)
+    //   Offset 32-47 (16 bytes): PADDING - reserved for future use
     //   Offset 48-51 (4 bytes):  init_state - atomic init state (0=uninit,1=legacy,2=init,3=ready)
     //   Offset 52-63 (12 bytes): PADDING - reserved for future use
     //
-    // [CONTROL ARRAY: sizeof(slot) * size_]
+    // [CONTROL ARRAY: sizeof(slot) * (size_ / items_per_slot)]
     //   Array of slot structures containing atomic indices and sizes
+    //
+    // [PADDING: only when items_per_slot != 1, up to the lowest set bit of sizeof(T)]
     //
     // [DATA ARRAY: sizeof(T) * size_]
     //   Array of queue elements
@@ -298,19 +322,36 @@ class SlickQueue {
     static constexpr uint32_t HEADER_SIZE = 64;
     static constexpr uint32_t LAST_PUBLISHED_OFFSET = 16;
     static constexpr uint32_t HEADER_MAGIC_OFFSET = 24;
+    // Segments created before the field existed left it zeroed, which reads as 1 - exactly
+    // the layout they have. A value other than 1 is also flagged in the marker (bit 1), so
+    // a peer too old to know this field is turned away instead of misreading the layout.
+    static constexpr uint32_t ITEMS_PER_SLOT_OFFSET = 28;
     static constexpr uint32_t INIT_STATE_OFFSET = 48;  // Offset in header for atomic init state
     // Layout marker: the bytes 'SLQ' followed by an ASCII digit whose low nibble carries
     // the features the creator was built with. Only options that change the shared header
     // protocol get a bit; the purely local ones (reset check, loss detection, cpu relax)
     // cost nothing to mix on one segment and deliberately have none.
     //   bit 0    - the last-published index at LAST_PUBLISHED_OFFSET is maintained
-    //   bits 1-3 - reserved for future shared-layout features, must be 0
+    //   bit 1    - items_per_slot at ITEMS_PER_SLOT_OFFSET is not 1, so the control array
+    //              is shorter than the data array
+    //   bits 2-3 - reserved for future shared-layout features, must be 0
     // Traits never reach the segment, so this word is the only cross-process signal of
     // what a peer agrees to maintain; every attacher matches it against its own - see
     // validate_header_magic().
+    //
+    // Bit 1 exists for peers built before items_per_slot. They know nothing of offset 28
+    // and would index the control array one slot per item, but they already reject any
+    // feature bit they do not recognise - so setting it only when items_per_slot != 1
+    // makes exactly the segments they would misread fail loudly, while a default segment
+    // still carries 'SLQ1'/'SLQ0' and stays open to them.
     static constexpr uint32_t HEADER_MAGIC = 0x534C5131;               // 'SLQ1'
     static constexpr uint32_t HEADER_MAGIC_FEATURE_MASK = 0x0000000Fu; // feature nibble
     static constexpr uint32_t HEADER_MAGIC_READ_LAST = 0x1u;           // feature bit 0
+    static constexpr uint32_t HEADER_MAGIC_ITEMS_PER_SLOT = 0x2u;      // feature bit 1
+    static constexpr uint32_t HEADER_MAGIC_KNOWN_FEATURES =
+        HEADER_MAGIC_READ_LAST | HEADER_MAGIC_ITEMS_PER_SLOT;
+    // The read_last part of the marker, fixed by Traits; header_magic_expected() adds the
+    // items_per_slot bit, which is only known at run time.
     static constexpr uint32_t HEADER_MAGIC_EXPECTED =
         Traits::enable_read_last ? HEADER_MAGIC : (HEADER_MAGIC & ~HEADER_MAGIC_READ_LAST);
     static constexpr uint32_t INIT_STATE_UNINITIALIZED = 0;
@@ -322,17 +363,50 @@ class SlickQueue {
         return value != 0 && ((value & (value - 1)) == 0);
     }
 
+    static constexpr uint32_t log2_pow2(uint32_t value) noexcept {
+        uint32_t shift = 0;
+        while ((value >> shift) > 1) {
+            ++shift;
+        }
+        return shift;
+    }
+
 public:
     /**
      * @brief Construct a new SlickQueue object
-     * 
+     *
      * @param size The size of the queue, must be a power of 2.
      * @param shm_name The name of the shared memory segment. If nullptr, the queue will use local memory.
-     * 
+     *
      * @throws std::runtime_error if shared memory allocation fails.
      * @throws std::invalid_argument if size is not a power of 2.
      */
     SlickQueue(uint32_t size, const char* const shm_name = nullptr)
+        : SlickQueue(size, 1u, shm_name)
+    {}
+
+    /**
+     * @brief Construct a new SlickQueue object whose control slots each cover several items
+     *
+     * items_per_slot is the minimum number of items a single reserve() consumes: reserve(n)
+     * rounds n up to a multiple of it. One control slot then covers one such unit, so the
+     * control array holds size / items_per_slot slots instead of size. Use it when T is
+     * small (a byte buffer) and the per-item control slot would dwarf the data.
+     *
+     * @param size The size of the queue, must be a power of 2.
+     * @param items_per_slot Minimum items per reservation, a power of 2 no greater than size.
+     * @param shm_name The name of the shared memory segment. If nullptr, the queue will use local memory.
+     *
+     * @throws std::runtime_error if shared memory allocation fails, or an existing segment
+     *         was created with a different items_per_slot.
+     * @throws std::invalid_argument if size or items_per_slot is not a power of 2, or
+     *         items_per_slot > size.
+     *
+     * A literal 0 or NULL as the second argument still selects the (size, shm_name)
+     * overload, as it did before this one existed - see detail::items_per_slot_arg.
+     */
+    SlickQueue(uint32_t size, detail::items_per_slot_arg items_per_slot,
+               const char* const shm_name = nullptr)
         : size_(size)
         , mask_(size ? size - 1 : 0)
         , own_(shm_name == nullptr)
@@ -341,6 +415,7 @@ public:
         if (!is_power_of_two(size_)) {
             throw std::invalid_argument("size must power of 2");
         }
+        set_items_per_slot(items_per_slot.value);
         if (shm_name) {
             allocate_shm_data(shm_name, false);
         } else {
@@ -351,7 +426,7 @@ public:
                 last_published_->store(kInvalidIndex, std::memory_order_relaxed);
             }
             data_ = new T[size_];
-            control_ = new slot[size_];
+            control_ = new slot[slot_count()];
         }
     }
 
@@ -408,6 +483,18 @@ public:
     constexpr uint32_t size() const noexcept { return size_; }
 
     /**
+     * @brief Get the minimum number of items a single reserve() consumes
+     * @return Items covered by one control slot; 1 unless set at construction
+     */
+    constexpr uint32_t items_per_slot() const noexcept { return items_per_slot_; }
+
+    /**
+     * @brief Get the number of control slots, size() / items_per_slot()
+     * @return Length of the control array
+     */
+    constexpr uint32_t slot_count() const noexcept { return size_ >> slot_shift_; }
+
+    /**
      * @brief Get the number of items skipped due to overwrite.
      * @return Count of skipped items observed by this queue instance, or 0 when
      *         Traits::enable_loss_detection is false.
@@ -440,14 +527,22 @@ public:
         if (n > size_) [[unlikely]] {
             throw std::runtime_error("required size " + std::to_string(n) + " > queue size " + std::to_string(size_));
         }
-        if (n == 1) {
-            constexpr reserved_info step = (1ULL << 16);
+        // The footprint in the ring: n rounded up to whole control slots. n <= size_ and
+        // size_ is a multiple of items_per_slot_, so need <= size_ as well.
+        const uint32_t need = align_up(n);
+        if (need == items_per_slot_) {
+            // One control slot's worth always fits without wrapping: the index is a
+            // multiple of items_per_slot_, so idx <= size_ - items_per_slot_.
+            //
+            // The 16-bit size field of reserved_info is vestigial - nothing reads it but
+            // this normalization - so its 65535 ceiling does not bound n.
+            const reserved_info step = static_cast<reserved_info>(items_per_slot_) << 16;
             auto prev = reserved_->fetch_add(step, std::memory_order_release);
             auto index = get_index(prev);
             auto prev_size = get_size(prev);
-            if (prev_size != 1) {
-                auto expected = make_reserved_info(index + 1, prev_size);
-                reserved_->compare_exchange_strong(expected, make_reserved_info(index + 1, 1),
+            if (prev_size != n) {
+                auto expected = make_reserved_info(index + items_per_slot_, prev_size);
+                reserved_->compare_exchange_strong(expected, make_reserved_info(index + items_per_slot_, n),
                     std::memory_order_release, std::memory_order_relaxed);
             }
             return index;
@@ -460,14 +555,14 @@ public:
             buffer_wrapped = false;
             index = get_index(reserved);
             auto idx = index & mask_;
-            if ((idx + n) > size_) {
+            if ((idx + need) > size_) {
                 // if there is no enough buffer left, start from the beginning
                 index += size_ - idx;
-                next = make_reserved_info(index + n, n);
+                next = make_reserved_info(index + need, n);
                 buffer_wrapped = true;
             }
             else {
-                next = make_reserved_info(index + n, n);
+                next = make_reserved_info(index + need, n);
             }
             if (reserved_->compare_exchange_weak(reserved, next, std::memory_order_release, std::memory_order_relaxed)) {
                 break;
@@ -477,7 +572,7 @@ public:
         if (buffer_wrapped) {
             // queue wrapped, set current slock.data_index to the reserved index to let the reader
             // know the next available data is in different slot.
-            auto& slot = control_[get_index(reserved) & mask_];
+            auto& slot = slot_at(get_index(reserved));
             slot.size.store(n, std::memory_order_relaxed);
             slot.data_index.store(index, std::memory_order_release);
         }
@@ -509,7 +604,7 @@ public:
      */
     void publish(uint64_t index, uint32_t n = 1) noexcept {
         assert(n > 0);
-        auto& slot = control_[index & mask_];
+        auto& slot = slot_at(index);
         // Relaxed: the release store below is what publishes it, and a reader that
         // acquires data_index therefore sees this size.
         slot.size.store(n, std::memory_order_relaxed);
@@ -544,7 +639,7 @@ public:
             }
 
             auto idx = read_index & mask_;
-            slot* current_slot = &control_[idx];
+            slot* current_slot = &slot_at(read_index);
             uint64_t index = current_slot->data_index.load(std::memory_order_acquire);
 
             // Recorded, not yet applied - the read below can still be sent round the
@@ -591,7 +686,9 @@ public:
 
             // index and read_index select the same slot here: they are either equal, or
             // index ran ahead within this same slot, which the branch above required.
-            read_index = index + sz;
+            // Advance by the footprint reserve() consumed, not the published size, so the
+            // cursor lands on the next reservation's slot.
+            read_index = index + align_up(static_cast<uint64_t>(sz));
             return std::make_pair(&data_[idx], sz);
         }
     }
@@ -621,7 +718,7 @@ public:
             }
 
             auto idx = current_index & mask_;
-            slot* current_slot = &control_[idx];
+            slot* current_slot = &slot_at(current_index);
             uint64_t index = current_slot->data_index.load(std::memory_order_acquire);
 
             if (index == kInvalidIndex || index < current_index) {
@@ -653,7 +750,7 @@ public:
             }
 
             // Try to atomically claim this item
-            uint64_t next_index = index + sz;
+            uint64_t next_index = index + align_up(static_cast<uint64_t>(sz));
             if (read_index.compare_exchange_weak(current_index, next_index, std::memory_order_relaxed, std::memory_order_relaxed)) {
                 if constexpr (Traits::enable_loss_detection) {
                     if (overrun != 0) {
@@ -684,7 +781,7 @@ public:
             return std::make_pair(nullptr, 0);
         }
         auto idx = last_index & mask_;
-        slot& s = control_[idx];
+        slot& s = slot_at(last_index);
         // The slot may already have been recycled by a wrapping producer, and publish()
         // writes slot.size before it advances last_published_. Validate the slot before
         // and after reading size (seqlock-style) so the returned {pointer, size} pair
@@ -707,10 +804,10 @@ public:
      */
     void reset() noexcept {
         if (use_shm_) {
-            control_ = new ((uint8_t*)lpvMem_ + HEADER_SIZE) slot[size_];
+            control_ = new ((uint8_t*)lpvMem_ + HEADER_SIZE) slot[slot_count()];
         } else {
             delete [] control_;
-            control_ = new slot[size_];
+            control_ = new slot[slot_count()];
         }
         reserved_->store(0, std::memory_order_release);
         if constexpr (Traits::enable_read_last) {
@@ -722,6 +819,74 @@ public:
     }
 
 private:
+    /// Validate items_per_slot against size_ and derive the masks from it. Shared by the
+    /// creating constructor and the attacher, which adopts the value from the header.
+    void set_items_per_slot(uint32_t items_per_slot) {
+        if (!is_power_of_two(items_per_slot)) {
+            throw std::invalid_argument("items_per_slot must power of 2");
+        }
+        // Both are powers of two, so this also guarantees size_ is a multiple of
+        // items_per_slot and slot_count() >= 1.
+        if (items_per_slot > size_) {
+            throw std::invalid_argument("items_per_slot " + std::to_string(items_per_slot) +
+                " > queue size " + std::to_string(size_));
+        }
+        items_per_slot_ = items_per_slot;
+        item_mask_ = items_per_slot - 1;
+        slot_shift_ = log2_pow2(items_per_slot);
+    }
+
+    /// Round n up to a whole number of control slots' worth of items.
+    uint32_t align_up(uint32_t n) const noexcept { return (n + item_mask_) & ~item_mask_; }
+    uint64_t align_up(uint64_t n) const noexcept {
+        return (n + item_mask_) & ~static_cast<uint64_t>(item_mask_);
+    }
+
+    /// The control slot that owns absolute index `index`. Every access to control_ goes
+    /// through here so the indexing sites cannot drift apart.
+    slot& slot_at(uint64_t index) noexcept { return control_[(index & mask_) >> slot_shift_]; }
+
+    /// Byte size of the control array.
+    std::size_t control_bytes() const noexcept { return sizeof(slot) * slot_count(); }
+
+    // Alignment the data array is padded to when items_per_slot != 1: the lowest set bit
+    // of sizeof(T). alignof(T) is a power of two dividing sizeof(T), so this is always a
+    // multiple of it - and unlike alignof(T) it can be derived from the element size in
+    // the header, which is all a peer in another language knows about T.
+    static constexpr std::size_t DATA_ALIGNMENT = sizeof(T) & (~sizeof(T) + 1);
+    static_assert(DATA_ALIGNMENT % alignof(T) == 0,
+        "the data array alignment must satisfy alignof(T)");
+
+    /**
+     * @brief Byte offset of the data array from the start of the shared-memory segment.
+     *
+     * With one control slot per item this is the legacy layout, byte for byte, so peers
+     * built before items_per_slot still read it. A shorter control array can leave the
+     * end of the control area misaligned for T - 64 + 16 = 80 for a single slot - so it
+     * is padded up to DATA_ALIGNMENT. Older peers never see that padding: a segment with
+     * items_per_slot != 1 carries the marker bit that turns them away.
+     */
+    std::size_t data_offset() const noexcept {
+        const std::size_t end = HEADER_SIZE + control_bytes();
+        if (items_per_slot_ == 1) {
+            return end;
+        }
+        return (end + DATA_ALIGNMENT - 1) & ~(DATA_ALIGNMENT - 1);
+    }
+
+    /// Placement-new and every access through data_ need it aligned for T. The legacy
+    /// layout can still miss that for an over-aligned T in a very small queue (alignas(32)
+    /// with size 1 puts the data at offset 80), which used to be undefined behaviour;
+    /// refuse it instead.
+    void check_data_alignment(const uint8_t* base) const {
+        const auto address = reinterpret_cast<std::uintptr_t>(base + data_offset());
+        if (address % alignof(T) != 0) {
+            throw std::runtime_error("Shared memory data array at offset " +
+                std::to_string(data_offset()) + " is not aligned for alignof(T) = " +
+                std::to_string(alignof(T)) + "; use a larger size or items_per_slot > 1");
+        }
+    }
+
     /**
      * @brief Detect that a concurrent reset() rewound the reservation counter below
      *        the absolute index still recorded in the slot being read.
@@ -811,6 +976,11 @@ private:
         return out;
     }
 
+    /// The marker this queue writes as a creator: the Traits part plus the items_per_slot bit.
+    uint32_t header_magic_expected() const noexcept {
+        return HEADER_MAGIC_EXPECTED | (items_per_slot_ != 1 ? HEADER_MAGIC_ITEMS_PER_SLOT : 0u);
+    }
+
     /**
      * @brief Reject an existing segment whose creator disagrees about the header protocol.
      *
@@ -820,13 +990,14 @@ private:
      * fatal: a queue that expects the last-published index would read a counter nobody
      * writes, and one that does not maintain it would silently freeze read_last() for
      * every peer that does.
+     *
+     * The items_per_slot bit is not matched against this queue: an attacher by name adopts
+     * the segment's value, and the creator constructor compares the field itself with a
+     * precise error. Here it is only required to agree with that field.
      */
     void validate_header_magic(const uint8_t* base) const {
         uint32_t magic = reinterpret_cast<const std::atomic<uint32_t>*>(
             base + HEADER_MAGIC_OFFSET)->load(std::memory_order_acquire);
-        if (magic == HEADER_MAGIC_EXPECTED) {
-            return;
-        }
 
         if ((magic & ~HEADER_MAGIC_FEATURE_MASK) != (HEADER_MAGIC & ~HEADER_MAGIC_FEATURE_MASK)) {
             throw std::runtime_error(
@@ -835,19 +1006,36 @@ private:
                 "; segments created before v1.4.0 carry no marker and are not supported");
         }
 
-        if ((magic & HEADER_MAGIC_FEATURE_MASK & ~HEADER_MAGIC_READ_LAST) != 0) {
+        if ((magic & HEADER_MAGIC_FEATURE_MASK & ~HEADER_MAGIC_KNOWN_FEATURES) != 0) {
             throw std::runtime_error(
                 "Shared memory was created with unknown layout features. Marker " +
                 to_hex(magic) + " is newer than this build understands (" +
-                to_hex(HEADER_MAGIC_EXPECTED) + ")");
+                to_hex(HEADER_MAGIC_EXPECTED | HEADER_MAGIC_KNOWN_FEATURES) + ")");
         }
 
-        throw std::runtime_error(
-            std::string("Shared memory feature mismatch: the segment was created with "
-                        "enable_read_last=") +
-            ((magic & HEADER_MAGIC_READ_LAST) ? "true" : "false") +
-            " but this queue has enable_read_last=" +
-            (Traits::enable_read_last ? "true" : "false"));
+        if ((magic & HEADER_MAGIC_READ_LAST) != (HEADER_MAGIC_EXPECTED & HEADER_MAGIC_READ_LAST)) {
+            throw std::runtime_error(
+                std::string("Shared memory feature mismatch: the segment was created with "
+                            "enable_read_last=") +
+                ((magic & HEADER_MAGIC_READ_LAST) ? "true" : "false") +
+                " but this queue has enable_read_last=" +
+                (Traits::enable_read_last ? "true" : "false"));
+        }
+
+        const uint32_t items_per_slot = read_items_per_slot(base);
+        if (((magic & HEADER_MAGIC_ITEMS_PER_SLOT) != 0) != (items_per_slot != 1)) {
+            throw std::runtime_error(
+                "Shared memory layout marker " + to_hex(magic) +
+                " disagrees with its items_per_slot field (" + std::to_string(items_per_slot) +
+                "); the segment is corrupt");
+        }
+    }
+
+    /// Segments created before the field existed left it zeroed; they have one control slot
+    /// per item, which is what 1 means.
+    static uint32_t read_items_per_slot(const uint8_t* base) noexcept {
+        uint32_t value = *reinterpret_cast<const uint32_t*>(base + ITEMS_PER_SLOT_OFFSET);
+        return value == 0 ? 1u : value;
     }
 
     void allocate_shm_data(const char* const shm_name, bool open_only) {
@@ -896,14 +1084,23 @@ private:
 
             mask_ = size_ - 1;
 
+            // Adopt the segment's granularity, as size_ is adopted above.
+            uint32_t items_per_slot = read_items_per_slot(base);
+            if (!is_power_of_two(items_per_slot) || items_per_slot > size_) {
+                throw std::runtime_error("Shared memory items_per_slot is invalid. Got " +
+                    std::to_string(items_per_slot) + " for size " + std::to_string(size_));
+            }
+            set_items_per_slot(items_per_slot);
+            check_data_alignment(base);
+
             // Map to existing structures
             reserved_ = reinterpret_cast<std::atomic<reserved_info>*>(base);
             control_ = reinterpret_cast<slot*>(base + HEADER_SIZE);
-            data_ = reinterpret_cast<T*>(base + HEADER_SIZE + sizeof(slot) * size_);
+            data_ = reinterpret_cast<T*>(base + data_offset());
 
         } else {
             // Creator constructor - create or open
-            const size_t total_size = HEADER_SIZE + sizeof(slot) * size_ + sizeof(T) * size_;
+            const size_t total_size = data_offset() + sizeof(T) * size_;
 
             try {
                 shm_ = slick::shm::shared_memory(
@@ -924,6 +1121,10 @@ private:
             auto* base = reinterpret_cast<uint8_t*>(lpvMem_);
             auto* init_state = reinterpret_cast<std::atomic<uint32_t>*>(base + INIT_STATE_OFFSET);
 
+            // Before claiming the segment: a creator that failed after the CAS would leave
+            // it INITIALIZING, and every attacher would time out rather than see this error.
+            check_data_alignment(base);
+
             uint32_t expected = INIT_STATE_UNINITIALIZED;
             bool we_are_creator = init_state->compare_exchange_strong(
                 expected, INIT_STATE_INITIALIZING, std::memory_order_acq_rel);
@@ -938,7 +1139,7 @@ private:
                 // a segment in either direction. Stored unconditionally so a recycled
                 // segment cannot leave a stale marker behind.
                 auto* header_magic = new (base + HEADER_MAGIC_OFFSET) std::atomic<uint32_t>();
-                header_magic->store(HEADER_MAGIC_EXPECTED, std::memory_order_release);
+                header_magic->store(header_magic_expected(), std::memory_order_release);
 
                 // Initialize atomic header
                 reserved_ = new (base) std::atomic<reserved_info>();
@@ -952,10 +1153,11 @@ private:
                     base + sizeof(std::atomic<reserved_info>)) = size_;
                 *reinterpret_cast<uint32_t*>(
                     base + sizeof(std::atomic<reserved_info>) + sizeof(uint32_t)) = sizeof(T);
+                *reinterpret_cast<uint32_t*>(base + ITEMS_PER_SLOT_OFFSET) = items_per_slot_;
 
                 // Placement-new arrays
-                control_ = new (base + HEADER_SIZE) slot[size_];
-                data_ = new (base + HEADER_SIZE + sizeof(slot) * size_) T[size_];
+                control_ = new (base + HEADER_SIZE) slot[slot_count()];
+                data_ = new (base + data_offset()) T[size_];
 
                 init_state->store(INIT_STATE_READY, std::memory_order_release);
 
@@ -984,11 +1186,16 @@ private:
                     throw std::runtime_error("Shared memory element size mismatch. Expected " +
                         std::to_string(sizeof(T)) + " but got " + std::to_string(element_size));
                 }
+                uint32_t shm_items_per_slot = read_items_per_slot(base);
+                if (shm_items_per_slot != items_per_slot_) {
+                    throw std::runtime_error("Shared memory items_per_slot mismatch. Expected " +
+                        std::to_string(items_per_slot_) + " but got " + std::to_string(shm_items_per_slot));
+                }
 
                 // Map to existing structures
                 reserved_ = reinterpret_cast<std::atomic<reserved_info>*>(base);
                 control_ = reinterpret_cast<slot*>(base + HEADER_SIZE);
-                data_ = reinterpret_cast<T*>(base + HEADER_SIZE + sizeof(slot) * size_);
+                data_ = reinterpret_cast<T*>(base + data_offset());
             }
         }
     }

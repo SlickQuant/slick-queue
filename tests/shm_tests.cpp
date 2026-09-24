@@ -412,6 +412,178 @@ TEST(ShmTests, AttachingWithoutReadLastToSegmentWithItThrows) {
       true);
 }
 
+TEST(ShmTests, ItemsPerSlotServerClient) {
+  // The attacher adopts the unit from the header, as it adopts the size.
+  slick::queue<char> server(256, 16, "sq_items_per_slot");
+  slick::queue<char> client("sq_items_per_slot");
+  EXPECT_EQ(client.size(), 256u);
+  EXPECT_EQ(client.items_per_slot(), 16u);
+  EXPECT_EQ(client.slot_count(), 16u);
+
+  const char* messages[] = {"hello", "a message longer than sixteen bytes", "x"};
+  for (const char* m : messages) {
+    auto n = static_cast<uint32_t>(std::strlen(m));
+    auto index = server.reserve(n);
+    std::memcpy(server[index], m, n);
+    server.publish(index, n);
+  }
+
+  uint64_t cursor = 0;
+  for (const char* m : messages) {
+    auto [data, n] = client.read(cursor);
+    ASSERT_NE(data, nullptr);
+    EXPECT_EQ(std::string(data, n), m);
+  }
+  EXPECT_EQ(cursor, 16u + 48u + 16u);
+
+  auto [latest, size] = client.read_last();
+  ASSERT_NE(latest, nullptr);
+  EXPECT_EQ(std::string(latest, size), "x");
+}
+
+TEST(ShmTests, ItemsPerSlotMismatchThrows) {
+  slick::queue<char> server(256, 16, "sq_items_per_slot_mismatch");
+  auto message = attach_failure_message(
+      [] { slick::queue<char>(256, 8, "sq_items_per_slot_mismatch"); });
+  EXPECT_NE(message.find("items_per_slot mismatch"), std::string::npos) << "actual: " << message;
+
+  // The default unit is a mismatch too, not a silent reinterpretation of the layout.
+  message = attach_failure_message(
+      [] { slick::queue<char>(256, "sq_items_per_slot_mismatch"); });
+  EXPECT_NE(message.find("items_per_slot mismatch"), std::string::npos) << "actual: " << message;
+}
+
+namespace {
+constexpr uint32_t kMarkerOffset = 24;
+
+uint32_t raw_marker(const char* name) {
+  slick::shm::shared_memory raw(name, slick::shm::open_existing,
+                                slick::shm::access_mode::read_write);
+  uint32_t marker = 0;
+  std::memcpy(&marker, static_cast<uint8_t*>(raw.data()) + kMarkerOffset, sizeof(marker));
+  return marker;
+}
+
+void set_raw_marker(const char* name, uint32_t marker) {
+  slick::shm::shared_memory raw(name, slick::shm::open_existing,
+                                slick::shm::access_mode::read_write);
+  std::memcpy(static_cast<uint8_t*>(raw.data()) + kMarkerOffset, &marker, sizeof(marker));
+}
+}  // namespace
+
+TEST(ShmTests, ItemsPerSlotSetsMarkerBit) {
+  // Bit 1 is what turns away a peer built before items_per_slot existed: such a peer
+  // rejects any feature bit it does not know, so the bit must be set exactly when the
+  // layout differs from the one it assumes - and never on a default segment, which it
+  // can still read correctly.
+  slick::queue<char> unit(256, 16, "sq_marker_unit");
+  EXPECT_EQ(raw_marker("sq_marker_unit"), 0x534C5133u);  // 'SLQ3'
+
+  slick::queue<char> plain(256, "sq_marker_plain");
+  EXPECT_EQ(raw_marker("sq_marker_plain"), 0x534C5131u);  // 'SLQ1', as before
+
+  slick::queue<char, no_read_last_traits> lean_unit(256, 16, "sq_marker_lean_unit");
+  EXPECT_EQ(raw_marker("sq_marker_lean_unit"), 0x534C5132u);  // 'SLQ2'
+
+  // The bit is known to this build, so both attach paths still accept the segment.
+  slick::queue<char> opener("sq_marker_unit");
+  EXPECT_EQ(opener.items_per_slot(), 16u);
+  EXPECT_NO_THROW({ slick::queue<char> again(256, 16, "sq_marker_unit"); });
+}
+
+TEST(ShmTests, MarkerBitDisagreeingWithFieldThrows) {
+  // The field is authoritative and the bit only mirrors it; a segment where the two
+  // disagree was written by something other than this library and is refused.
+  slick::queue<char> unit(256, 16, "sq_marker_corrupt_unit");
+  set_raw_marker("sq_marker_corrupt_unit", 0x534C5131u);  // bit cleared, field says 16
+  auto message = attach_failure_message([] { slick::queue<char>("sq_marker_corrupt_unit"); });
+  EXPECT_NE(message.find("disagrees with its items_per_slot field"), std::string::npos)
+      << "actual: " << message;
+
+  slick::queue<char> plain(256, "sq_marker_corrupt_plain");
+  set_raw_marker("sq_marker_corrupt_plain", 0x534C5133u);  // bit set, field says 1
+  message = attach_failure_message([] { slick::queue<char>("sq_marker_corrupt_plain"); });
+  EXPECT_NE(message.find("disagrees with its items_per_slot field"), std::string::npos)
+      << "actual: " << message;
+}
+
+TEST(ShmTests, UnknownMarkerBitStillRejected) {
+  // Bits 2-3 remain reserved, so a future feature fails as loudly for this build as
+  // items_per_slot does for an older one.
+  slick::queue<char> creator(256, "sq_marker_unknown");
+  set_raw_marker("sq_marker_unknown", 0x534C5131u | 0x4u);
+  auto message = attach_failure_message([] { slick::queue<char>("sq_marker_unknown"); });
+  EXPECT_NE(message.find("unknown layout features"), std::string::npos) << "actual: " << message;
+}
+
+namespace {
+struct alignas(32) wide_element {
+  uint32_t value;
+  char pad[28];
+};
+}  // namespace
+
+TEST(ShmTests, ItemsPerSlotPadsDataArrayForOverAlignedT) {
+  // Regression: with one 16-byte control slot the data array started at offset 80, which
+  // is not 32-byte aligned, so placement-new of an alignas(32) T was undefined behaviour.
+  slick::queue<wide_element> server(64, 64, "sq_ips_align");
+  ASSERT_EQ(server.slot_count(), 1u);
+  slick::queue<wide_element> client("sq_ips_align");
+
+  // The ring holds a single unit, so each message is read before the next replaces it.
+  uint64_t cursor = 0;
+  for (uint32_t i = 0; i < 3; ++i) {
+    auto index = server.reserve();
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(server[index]) % alignof(wide_element), 0u);
+    server[index]->value = 100 + i;
+    server.publish(index);
+
+    auto [data, n] = client.read(cursor);
+    ASSERT_NE(data, nullptr);
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(data) % alignof(wide_element), 0u);
+    EXPECT_EQ(data->value, 100 + i);
+  }
+}
+
+TEST(ShmTests, MisalignedLegacyLayoutIsRefused) {
+  // The default layout is kept byte-identical for older peers, so it is not padded; for
+  // an over-aligned T in a one-item queue it would misplace the data array, which must
+  // now be an error rather than undefined behaviour.
+  auto message = attach_failure_message(
+      [] { slick::queue<wide_element>(1, "sq_ips_align_legacy"); });
+  EXPECT_NE(message.find("not aligned for alignof(T)"), std::string::npos)
+      << "actual: " << message;
+
+  // One item per slot and a queue large enough keeps the legacy layout and works.
+  EXPECT_NO_THROW({ slick::queue<wide_element> ok(2, "sq_ips_align_legacy_ok"); });
+}
+
+TEST(ShmTests, ZeroItemsPerSlotInHeaderReadsAsOne) {
+  // Segments created before the field existed left it zeroed. Simulate one by clearing
+  // the field on a default segment, then attach both ways.
+  slick::queue<int> creator(8, "sq_items_per_slot_legacy");
+  {
+    slick::shm::shared_memory raw("sq_items_per_slot_legacy", slick::shm::open_existing,
+                                  slick::shm::access_mode::read_write);
+    auto* base = static_cast<uint8_t*>(raw.data());
+    ASSERT_NE(base, nullptr);
+    uint32_t zero = 0;
+    std::memcpy(base + 28, &zero, sizeof(zero));
+  }
+
+  slick::queue<int> opener("sq_items_per_slot_legacy");
+  EXPECT_EQ(opener.items_per_slot(), 1u);
+  EXPECT_NO_THROW({ slick::queue<int> again(8, "sq_items_per_slot_legacy"); });
+
+  auto slot = creator.reserve();
+  *creator[slot] = 11;
+  creator.publish(slot);
+  uint64_t cursor = 0;
+  auto read = opener.read(cursor);
+  ASSERT_NE(read.first, nullptr);
+  EXPECT_EQ(*read.first, 11);
+}
+
 TEST(ShmTests, MatchingReadLastOffTraitsShareSegment) {
   // Both sides agree the index is not maintained, so the markers match and the segment
   // works normally through the cursor-based read path.
