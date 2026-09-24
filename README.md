@@ -87,7 +87,7 @@ set(BUILD_SLICK_QUEUE_TESTS OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
     slick-queue
     GIT_REPOSITORY https://github.com/SlickQuant/slick-queue.git
-    GIT_TAG v2.0.0  # See https://github.com/SlickQuant/slick-queue/releases for latest version
+    GIT_TAG v2.1.0  # See https://github.com/SlickQuant/slick-queue/releases for latest version
 )
 FetchContent_MakeAvailable(slick-queue)
 

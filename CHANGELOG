@@ -1,3 +1,28 @@
+# v2.1.0 - 2026-09-24
+
+## Control slots can cover several items (`items_per_slot`)
+- New constructors `queue(size, items_per_slot)` and `queue(size, items_per_slot, shm_name)`. `items_per_slot` is the minimum number of items a single `reserve()` consumes: `reserve(n)` rounds `n` up to a multiple of it, and one 16-byte control slot covers one such unit, so the control array holds `size / items_per_slot` slots instead of `size`. A 16M-item `slick::queue<char>` byte buffer drops from 256 MB of control to 4 MB with `items_per_slot = 64`
+- The trade-off is that a message shorter than `items_per_slot` still costs a whole unit, so the queue holds at most `size / items_per_slot` messages. A message longer than the minimum spans several units under one control slot
+- `read()` returns the published size and advances the cursor by the whole units the reservation consumed. `items_per_slot()` and `slot_count()` report the geometry
+- Defaults to 1, which keeps the previous behaviour, object layout and shared-memory layout byte for byte; `sizeof(queue)` is unchanged in every configuration because the new members fit in existing padding
+- Source compatible: `queue(size, 0)` and `queue(size, NULL)` still select the `(size, shm_name)` overload rather than becoming ambiguous
+
+## Shared memory
+- `items_per_slot` is stored at header offset 28, previously reserved padding. The attacher constructor `queue(shm_name)` adopts it as it adopts `size`, and a creator constructor opening an existing segment with a different value throws `std::runtime_error`. A zero field - every segment created by 2.0.0 and earlier - reads as 1
+- Layout marker feature bit 1 is set when `items_per_slot != 1` (`'SLQ3'`, or `'SLQ2'` without `enable_read_last`). Peers from 2.0.0 and earlier reject feature bits they do not recognise, so they refuse such a segment at attach time ("unknown layout features") instead of indexing its control array one slot per item. Default segments keep `'SLQ1'`/`'SLQ0'` and stay compatible with them in both directions. A marker whose bit disagrees with the offset-28 field is rejected as corrupt
+- When `items_per_slot != 1` the data array is padded to the lowest set bit of `sizeof(T)` - always a multiple of `alignof(T)` - so a short control array cannot leave it misaligned for an over-aligned `T`. The rule depends only on values in the header, so slick-queue-py computes the same offset
+
+## Fixes
+- A shared-memory queue whose data array would start misaligned for `T` now throws `std::runtime_error` at construction instead of placement-new'ing into misaligned memory. With `items_per_slot == 1` the layout stays unpadded for compatibility, so this only arises for an over-aligned `T` in a very small queue (e.g. `alignas(32)` with `size = 1`), which was previously undefined behaviour. The check runs before the creator claims the segment, so attachers never see a half-initialised one
+
+## Build
+- New CMake option `SLICK_QUEUE_ENABLE_ASAN` (default OFF) builds the tests, and the GoogleTest they link, with AddressSanitizer. `slick::queue` itself never carries the flags, so consumers are unaffected. On MSVC it strips the incompatible `/RTC1` and incremental linking, and copies the ASan runtime DLL next to the test binary
+- CI runs the test suite under ASan on Linux, Windows and macOS, in Debug and Release
+
+## Tests
+- Added 12 `items_per_slot` tests: reservation rounding, cursor advance by unit for both `read()` overloads, multi-unit messages, mid-buffer wrap, `read_last()` after wrap, `reset()`, bad arguments, the literal-0 and `NULL` overloads, and a concurrent wrapping-producer stress test restating the cursor/size invariant in units
+- Added 8 shared-memory tests: attacher adoption, creator mismatch, the legacy zero field, the marker bit in each configuration, a marker contradicting its field, reserved bits 2-3 still rejected, data alignment for an `alignas(32)` element with a single control slot, and the misaligned legacy layout being refused
+
 # v2.0.0 - 2026-09-05
 
 ## Feature configuration moved from macros to a traits template parameter
