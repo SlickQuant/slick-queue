@@ -388,7 +388,17 @@ ctest --output-on-failure
 ### Build Options
 
 - `BUILD_SLICK_QUEUE_TESTS` - Enable/disable test building (default: ON)
+- `SLICK_QUEUE_ENABLE_ASAN` - Build the tests, and the GoogleTest they link, with AddressSanitizer (default: OFF). Only the test binary is instrumented; `slick::queue` never carries the flags, so consumers are unaffected. CI runs the suite this way on every platform.
 - `CMAKE_BUILD_TYPE` - Set to `Release` or `Debug`
+
+```bash
+cmake -S . -B build-asan -DSLICK_QUEUE_ENABLE_ASAN=ON
+cmake --build build-asan
+cd build-asan && ctest --output-on-failure
+```
+
+With MSVC, the ASan runtime DLL is copied next to the test binary automatically, so no `PATH`
+setup is needed.
 
 ## License
 

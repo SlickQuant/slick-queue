@@ -9,6 +9,15 @@ set(CMAKE_CXX_STANDARD 20)
 
 # Options:
 option(BUILD_SLICK_QUEUE_TESTS "Build tests" ${PROJECT_IS_TOP_LEVEL})
+# Instruments the test binary (and the GoogleTest it links) with AddressSanitizer. The
+# library is header-only, so this is how its code gets checked; slick::queue itself never
+# carries the flags, and consumers are unaffected.
+option(SLICK_QUEUE_ENABLE_ASAN "Build tests with AddressSanitizer" OFF)
+
+if(SLICK_QUEUE_ENABLE_ASAN AND NOT BUILD_SLICK_QUEUE_TESTS)
+    message(WARNING "SLICK_QUEUE_ENABLE_ASAN only instruments the tests; it has no effect "
+                    "with BUILD_SLICK_QUEUE_TESTS=OFF")
+endif()
 
 find_package(slick-shm CONFIG QUIET)
 

@@ -30,3 +30,27 @@ jobs:
     - name: Run Tests
       working-directory: build
       run: ctest -C ${{ matrix.build_type }} --output-on-failure
+
+  asan:
+    name: asan (${{ matrix.os }}, ${{ matrix.build_type }})
+    strategy:
+      # One sanitizer report should not hide the others'.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        build_type: [Debug, Release]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Configure CMake
+      run: cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DSLICK_QUEUE_ENABLE_ASAN=ON
+
+    - name: Build
+      run: cmake --build build --config ${{ matrix.build_type }}
+
+    - name: Run Tests
+      working-directory: build
+      run: ctest -C ${{ matrix.build_type }} --output-on-failure
