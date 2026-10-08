@@ -144,6 +144,20 @@ if (result.first != nullptr) {
 }
 ```
 
+**Segment lifetime**: a queue never removes its shared-memory segment on destruction, not even
+the queue that created it. On POSIX the name stays until it is unlinked, so if a departing process
+unlinked it while a peer was still attached, that peer would keep reading the old mapping while
+a restarted or late process created a new segment under the same name. Instead, the process that
+coordinates the queue's lifetime calls `remove_shm()` (or
+`slick::shm::shared_memory::remove(name)`) once no peer will attach again. A process that
+restarts in the meantime reattaches to the existing segment and keeps its contents. On Windows the
+segment is freed automatically when its last handle closes.
+
+```cpp
+// Coordinator, after every worker has shut down
+server.remove_shm();
+```
+
 ### Multi-Producer Multi-Consumer
 
 ```cpp
@@ -303,6 +317,7 @@ and remains fully compatible with older peers.
 - `uint32_t slot_count()` - Get the number of control slots, `size() / items_per_slot()`
 - `bool use_shm()` - Whether the queue lives in shared memory
 - `const char* shm_name()` - Get the shared-memory segment name (empty string for a local-memory queue)
+- `bool remove_shm()` - Unlink the shared-memory segment's name so the next queue created with it starts fresh; open mappings stay valid. The destructor never does this (see [Segment lifetime](#shared-memory-example-ipc)). Returns `false` for a local-memory queue
 - `uint64_t loss_count() const` - Get count of skipped items due to overwrite (0 when the feature is off)
 - `void reset()` - Reset the queue, invalidating all existing data
 

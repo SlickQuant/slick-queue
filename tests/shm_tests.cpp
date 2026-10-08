@@ -4,6 +4,8 @@
 #include <string>
 #include <thread>
 #include <cstring>
+#include <memory>
+#include <vector>
 
 #include "test_traits.h"
 
@@ -32,23 +34,50 @@ void expect_read_last_mismatch(const std::string& message, bool segment_tracks) 
 }
 }  // namespace
 
-TEST(ShmTests, ReadEmptyQueue) {
-  slick::queue<int> queue(2, "sq_read_empty");
+/// A queue never unlinks its segment, so on POSIX every name a test uses would outlive the
+/// test and hand the next run a stale segment. shm() unlinks a name the first time a test
+/// uses it, clearing whatever a crashed run left behind, and TearDown() unlinks it again
+/// once the test's queues are gone.
+class ShmTests : public ::testing::Test {
+protected:
+  const char* shm(const char* name) {
+    for (const auto& used : names_) {
+      if (used == name) {
+        return name;
+      }
+    }
+    slick::shm::shared_memory::remove(name);
+    names_.emplace_back(name);
+    return name;
+  }
+
+  void TearDown() override {
+    for (const auto& name : names_) {
+      slick::shm::shared_memory::remove(name.c_str());
+    }
+  }
+
+private:
+  std::vector<std::string> names_;
+};
+
+TEST_F(ShmTests, ReadEmptyQueue) {
+  slick::queue<int> queue(2, shm("sq_read_empty"));
   uint64_t read_cursor = 0;
   auto read = queue.read(read_cursor);
   EXPECT_EQ(read.first, nullptr);
 }
 
-TEST(ShmTests, Reserve) {
-  slick::queue<int> queue(2, "sq_reserve");
+TEST_F(ShmTests, Reserve) {
+  slick::queue<int> queue(2, shm("sq_reserve"));
   auto reserved = queue.reserve();
   EXPECT_EQ(reserved, 0);
   EXPECT_EQ(queue.reserve(), 1);
   EXPECT_EQ(queue.reserve(), 2);
 }
 
-TEST(ShmTests, ReadShouldFailWithoutPublish) {
-  slick::queue<int> queue(2, "sq_read_fail");
+TEST_F(ShmTests, ReadShouldFailWithoutPublish) {
+  slick::queue<int> queue(2, shm("sq_read_fail"));
   uint64_t read_cursor = 0;
   auto reserved = queue.reserve();
   auto read = queue.read(read_cursor);
@@ -56,8 +85,8 @@ TEST(ShmTests, ReadShouldFailWithoutPublish) {
   EXPECT_EQ(read_cursor, 0);
 }
 
-TEST(ShmTests, PublishAndRead) {
-  slick::queue<int> queue(2, "sq_publish_read");
+TEST_F(ShmTests, PublishAndRead) {
+  slick::queue<int> queue(2, shm("sq_publish_read"));
   uint64_t read_cursor = 0;
   auto reserved = queue.reserve();
   *queue[reserved] = 5;
@@ -68,8 +97,8 @@ TEST(ShmTests, PublishAndRead) {
   EXPECT_EQ(*read.first, 5);
 }
 
-TEST(ShmTests, PublishAndReadMultiple) {
-  slick::queue<int> queue(4, "sq_publish_read_multiple");
+TEST_F(ShmTests, PublishAndReadMultiple) {
+  slick::queue<int> queue(4, shm("sq_publish_read_multiple"));
   uint64_t read_cursor = 0;
   auto reserved = queue.reserve();
   *queue[reserved] = 5;
@@ -100,9 +129,9 @@ TEST(ShmTests, PublishAndReadMultiple) {
   EXPECT_EQ(*read.first, 23);
 }
 
-TEST(ShmTests, ServerClient) {
-  slick::queue<int> server(4, "sq_server_cleint");
-  slick::queue<int> client("sq_server_cleint");
+TEST_F(ShmTests, ServerClient) {
+  slick::queue<int> server(4, shm("sq_server_cleint"));
+  slick::queue<int> client(shm("sq_server_cleint"));
   EXPECT_EQ(client.size(), 4);
 
   auto reserved = server.reserve();
@@ -136,10 +165,10 @@ TEST(ShmTests, ServerClient) {
   EXPECT_EQ(*read.first, 23);
 }
 
-TEST(ShmTests, AtomicCursorWorkStealing) {
-  slick::queue<int> server(1024, "sq_atomic_cursor_shm");
-  slick::queue<int> client1("sq_atomic_cursor_shm");
-  slick::queue<int> client2("sq_atomic_cursor_shm");
+TEST_F(ShmTests, AtomicCursorWorkStealing) {
+  slick::queue<int> server(1024, shm("sq_atomic_cursor_shm"));
+  slick::queue<int> client1(shm("sq_atomic_cursor_shm"));
+  slick::queue<int> client2(shm("sq_atomic_cursor_shm"));
 
   std::atomic<uint64_t> shared_cursor{0};
   std::atomic<int> total_consumed{0};
@@ -178,10 +207,10 @@ TEST(ShmTests, AtomicCursorWorkStealing) {
   EXPECT_EQ(shared_cursor.load(), 100);
 }
 
-TEST(ShmTests, LossyOverwriteSkipsOldData) {
+TEST_F(ShmTests, LossyOverwriteSkipsOldData) {
   // loss_traits pins the counter on, so this assertion runs in every build.
-  slick::queue<int, loss_traits> server(2, "sq_lossy_overwrite");
-  slick::queue<int, loss_traits> client("sq_lossy_overwrite");
+  slick::queue<int, loss_traits> server(2, shm("sq_lossy_overwrite"));
+  slick::queue<int, loss_traits> client(shm("sq_lossy_overwrite"));
 
   auto s0 = server.reserve();
   *server[s0] = 10;
@@ -207,22 +236,22 @@ TEST(ShmTests, LossyOverwriteSkipsOldData) {
   EXPECT_EQ(read.first, nullptr);
 }
 
-TEST(ShmTests, ElementSizeMismatch) {
-  slick::queue<int> server(4, "sq_element_mismatch");
+TEST_F(ShmTests, ElementSizeMismatch) {
+  slick::queue<int> server(4, shm("sq_element_mismatch"));
   EXPECT_THROW({
-    slick::queue<double> client("sq_element_mismatch");
+    slick::queue<double> client(shm("sq_element_mismatch"));
   }, std::runtime_error);
 }
 
-TEST(ShmTests, SizeMismatch) {
+TEST_F(ShmTests, SizeMismatch) {
   // Create a shared memory queue with size 4
-  slick::queue<int> server(4, "sq_size_mismatch");
+  slick::queue<int> server(4, shm("sq_size_mismatch"));
 
   // Try to create another queue with same name but different size
   // This should throw an exception
   EXPECT_THROW({
     try {
-      slick::queue<int> client(8, "sq_size_mismatch");
+      slick::queue<int> client(8, shm("sq_size_mismatch"));
     } catch (const std::runtime_error& e) {
       EXPECT_TRUE(std::string(e.what()).find("Shared memory size mismatch") != std::string::npos);
       throw;
@@ -230,9 +259,9 @@ TEST(ShmTests, SizeMismatch) {
   }, std::runtime_error);
 }
 
-TEST(ShmTests, ReadLastUsesLatestReserveSize) {
-  slick::queue<int> queue(8, "sq_read_last");
-  slick::queue<int> reader_queue(8, "sq_read_last");
+TEST_F(ShmTests, ReadLastUsesLatestReserveSize) {
+  slick::queue<int> queue(8, shm("sq_read_last"));
+  slick::queue<int> reader_queue(8, shm("sq_read_last"));
 
   auto first = queue.reserve(2);
   *queue[first] = 1;
@@ -249,9 +278,9 @@ TEST(ShmTests, ReadLastUsesLatestReserveSize) {
   EXPECT_EQ(size, 1);
 }
 
-TEST(ShmTests, ReadLastIgnoresUnpublishedReservation) {
-  slick::queue<int> queue(8, "sq_read_last2");
-  slick::queue<int> reader_queue(8, "sq_read_last2");
+TEST_F(ShmTests, ReadLastIgnoresUnpublishedReservation) {
+  slick::queue<int> queue(8, shm("sq_read_last2"));
+  slick::queue<int> reader_queue(8, shm("sq_read_last2"));
 
   auto first = queue.reserve(2);
   *queue[first] = 1;
@@ -267,9 +296,9 @@ TEST(ShmTests, ReadLastIgnoresUnpublishedReservation) {
   EXPECT_EQ(size, 2);
 }
 
-TEST(ShmTests, ReadLastUsesLatestReserveSizeMultiple) {
-  slick::queue<char> queue(256, "sq_read_last_multi");
-  slick::queue<char> reader_queue(256, "sq_read_last_multi");
+TEST_F(ShmTests, ReadLastUsesLatestReserveSizeMultiple) {
+  slick::queue<char> queue(256, shm("sq_read_last_multi"));
+  slick::queue<char> reader_queue(256, shm("sq_read_last_multi"));
 
   const char* first_str = "One";
   uint32_t length = static_cast<uint32_t>(std::strlen(first_str) + 1);
@@ -289,9 +318,9 @@ TEST(ShmTests, ReadLastUsesLatestReserveSizeMultiple) {
   EXPECT_EQ(strncmp(latest, last_str, size), 0);
 }
 
-TEST(ShmTests, ReadLastIgnoresUnpublishedReservationMultiple) {
-  slick::queue<char> queue(256, "sq_read_last_multi2");
-  slick::queue<char> reader_queue(256, "sq_read_last_multi2");
+TEST_F(ShmTests, ReadLastIgnoresUnpublishedReservationMultiple) {
+  slick::queue<char> queue(256, shm("sq_read_last_multi2"));
+  slick::queue<char> reader_queue(256, shm("sq_read_last_multi2"));
 
   const char* first_str = "One";
   uint32_t length = static_cast<uint32_t>(std::strlen(first_str) + 1);
@@ -310,13 +339,13 @@ TEST(ShmTests, ReadLastIgnoresUnpublishedReservationMultiple) {
   EXPECT_EQ(strncmp(latest, first_str, size), 0);
 }
 
-TEST(ShmTests, ReadLastAfterWrap) {
+TEST_F(ShmTests, ReadLastAfterWrap) {
   // Regression: same out-of-bounds read as SlickQueueTests.ReadLastAfterWrap,
   // exercised through a shared-memory segment. The reader uses the attacher
   // constructor, so read_last()'s masking is validated against a mask_ derived
   // from the segment header rather than one supplied locally.
-  slick::queue<int> queue(4, "sq_read_last_wrap");
-  slick::queue<int> reader_queue("sq_read_last_wrap");
+  slick::queue<int> queue(4, shm("sq_read_last_wrap"));
+  slick::queue<int> reader_queue(shm("sq_read_last_wrap"));
   ASSERT_EQ(reader_queue.size(), 4u);
 
   for (int i = 0; i < 10; ++i) {
@@ -331,10 +360,10 @@ TEST(ShmTests, ReadLastAfterWrap) {
   EXPECT_EQ(*latest, 9);
 }
 
-TEST(ShmTests, ResetRestartsSegment) {
+TEST_F(ShmTests, ResetRestartsSegment) {
   // reset_check_traits compiles the opt-in reset-detection path into these reads.
-  slick::queue<int, reset_check_traits> queue(4, "sq_reset");
-  slick::queue<int, reset_check_traits> reader_queue("sq_reset");
+  slick::queue<int, reset_check_traits> queue(4, shm("sq_reset"));
+  slick::queue<int, reset_check_traits> reader_queue(shm("sq_reset"));
 
   for (int i = 0; i < 10; ++i) {
     auto slot = queue.reserve();
@@ -366,12 +395,12 @@ TEST(ShmTests, ResetRestartsSegment) {
   EXPECT_EQ(*latest, 42);
 }
 
-TEST(ShmTests, MixedTraitsOnOneSegment) {
+TEST_F(ShmTests, MixedTraitsOnOneSegment) {
   // Traits that differ only in locally-held features (loss detection here) share a
   // segment freely: they leave the same feature nibble in the marker, which is the only
   // cross-process signal of what a peer maintains.
-  slick::queue<int> creator(4, "sq_mixed_traits");
-  slick::queue<int, loss_traits> attacher("sq_mixed_traits");
+  slick::queue<int> creator(4, shm("sq_mixed_traits"));
+  slick::queue<int, loss_traits> attacher(shm("sq_mixed_traits"));
   ASSERT_EQ(attacher.size(), 4u);
 
   auto slot = creator.reserve();
@@ -384,38 +413,38 @@ TEST(ShmTests, MixedTraitsOnOneSegment) {
   EXPECT_EQ(*latest, 7);
 }
 
-TEST(ShmTests, AttachingWithReadLastToSegmentWithoutItThrows) {
+TEST_F(ShmTests, AttachingWithReadLastToSegmentWithoutItThrows) {
   // The creator never maintains the last-published index, so its marker clears the
   // feature bit. An attacher that does read that index would otherwise trust a counter
   // nobody writes; it must be turned away at attach time instead.
-  slick::queue<int, no_read_last_traits> creator(4, "sq_feature_mismatch_off");
+  slick::queue<int, no_read_last_traits> creator(4, shm("sq_feature_mismatch_off"));
 
   expect_read_last_mismatch(
-      attach_failure_message([] { slick::queue<int>("sq_feature_mismatch_off"); }), false);
+      attach_failure_message([&] { (void)slick::queue<int>(shm("sq_feature_mismatch_off")); }), false);
   expect_read_last_mismatch(
-      attach_failure_message([] { slick::queue<int>(4, "sq_feature_mismatch_off"); }), false);
+      attach_failure_message([&] { (void)slick::queue<int>(4, shm("sq_feature_mismatch_off")); }), false);
 }
 
-TEST(ShmTests, AttachingWithoutReadLastToSegmentWithItThrows) {
+TEST_F(ShmTests, AttachingWithoutReadLastToSegmentWithItThrows) {
   // The mirror image, and the case the old validity flag could not catch at all: this
   // attacher's publish() would never advance the index, silently freezing read_last()
   // for the creator and every other peer that does maintain it.
-  slick::queue<int> creator(4, "sq_feature_mismatch_on");
+  slick::queue<int> creator(4, shm("sq_feature_mismatch_on"));
 
   expect_read_last_mismatch(
       attach_failure_message(
-          [] { slick::queue<int, no_read_last_traits>("sq_feature_mismatch_on"); }),
+          [&] { (void)slick::queue<int, no_read_last_traits>(shm("sq_feature_mismatch_on")); }),
       true);
   expect_read_last_mismatch(
       attach_failure_message(
-          [] { slick::queue<int, no_read_last_traits>(4, "sq_feature_mismatch_on"); }),
+          [&] { (void)slick::queue<int, no_read_last_traits>(4, shm("sq_feature_mismatch_on")); }),
       true);
 }
 
-TEST(ShmTests, ItemsPerSlotServerClient) {
+TEST_F(ShmTests, ItemsPerSlotServerClient) {
   // The attacher adopts the unit from the header, as it adopts the size.
-  slick::queue<char> server(256, 16, "sq_items_per_slot");
-  slick::queue<char> client("sq_items_per_slot");
+  slick::queue<char> server(256, 16, shm("sq_items_per_slot"));
+  slick::queue<char> client(shm("sq_items_per_slot"));
   EXPECT_EQ(client.size(), 256u);
   EXPECT_EQ(client.items_per_slot(), 16u);
   EXPECT_EQ(client.slot_count(), 16u);
@@ -441,15 +470,15 @@ TEST(ShmTests, ItemsPerSlotServerClient) {
   EXPECT_EQ(std::string(latest, size), "x");
 }
 
-TEST(ShmTests, ItemsPerSlotMismatchThrows) {
-  slick::queue<char> server(256, 16, "sq_items_per_slot_mismatch");
+TEST_F(ShmTests, ItemsPerSlotMismatchThrows) {
+  slick::queue<char> server(256, 16, shm("sq_items_per_slot_mismatch"));
   auto message = attach_failure_message(
-      [] { slick::queue<char>(256, 8, "sq_items_per_slot_mismatch"); });
+      [&] { (void)slick::queue<char>(256, 8, shm("sq_items_per_slot_mismatch")); });
   EXPECT_NE(message.find("items_per_slot mismatch"), std::string::npos) << "actual: " << message;
 
   // The default unit is a mismatch too, not a silent reinterpretation of the layout.
   message = attach_failure_message(
-      [] { slick::queue<char>(256, "sq_items_per_slot_mismatch"); });
+      [&] { (void)slick::queue<char>(256, shm("sq_items_per_slot_mismatch")); });
   EXPECT_NE(message.find("items_per_slot mismatch"), std::string::npos) << "actual: " << message;
 }
 
@@ -471,48 +500,48 @@ void set_raw_marker(const char* name, uint32_t marker) {
 }
 }  // namespace
 
-TEST(ShmTests, ItemsPerSlotSetsMarkerBit) {
+TEST_F(ShmTests, ItemsPerSlotSetsMarkerBit) {
   // Bit 1 is what turns away a peer built before items_per_slot existed: such a peer
   // rejects any feature bit it does not know, so the bit must be set exactly when the
   // layout differs from the one it assumes - and never on a default segment, which it
   // can still read correctly.
-  slick::queue<char> unit(256, 16, "sq_marker_unit");
-  EXPECT_EQ(raw_marker("sq_marker_unit"), 0x534C5133u);  // 'SLQ3'
+  slick::queue<char> unit(256, 16, shm("sq_marker_unit"));
+  EXPECT_EQ(raw_marker(shm("sq_marker_unit")), 0x534C5133u);  // 'SLQ3'
 
-  slick::queue<char> plain(256, "sq_marker_plain");
-  EXPECT_EQ(raw_marker("sq_marker_plain"), 0x534C5131u);  // 'SLQ1', as before
+  slick::queue<char> plain(256, shm("sq_marker_plain"));
+  EXPECT_EQ(raw_marker(shm("sq_marker_plain")), 0x534C5131u);  // 'SLQ1', as before
 
-  slick::queue<char, no_read_last_traits> lean_unit(256, 16, "sq_marker_lean_unit");
-  EXPECT_EQ(raw_marker("sq_marker_lean_unit"), 0x534C5132u);  // 'SLQ2'
+  slick::queue<char, no_read_last_traits> lean_unit(256, 16, shm("sq_marker_lean_unit"));
+  EXPECT_EQ(raw_marker(shm("sq_marker_lean_unit")), 0x534C5132u);  // 'SLQ2'
 
   // The bit is known to this build, so both attach paths still accept the segment.
-  slick::queue<char> opener("sq_marker_unit");
+  slick::queue<char> opener(shm("sq_marker_unit"));
   EXPECT_EQ(opener.items_per_slot(), 16u);
-  EXPECT_NO_THROW({ slick::queue<char> again(256, 16, "sq_marker_unit"); });
+  EXPECT_NO_THROW({ slick::queue<char> again(256, 16, shm("sq_marker_unit")); });
 }
 
-TEST(ShmTests, MarkerBitDisagreeingWithFieldThrows) {
+TEST_F(ShmTests, MarkerBitDisagreeingWithFieldThrows) {
   // The field is authoritative and the bit only mirrors it; a segment where the two
   // disagree was written by something other than this library and is refused.
-  slick::queue<char> unit(256, 16, "sq_marker_corrupt_unit");
-  set_raw_marker("sq_marker_corrupt_unit", 0x534C5131u);  // bit cleared, field says 16
-  auto message = attach_failure_message([] { slick::queue<char>("sq_marker_corrupt_unit"); });
+  slick::queue<char> unit(256, 16, shm("sq_marker_corrupt_unit"));
+  set_raw_marker(shm("sq_marker_corrupt_unit"), 0x534C5131u);  // bit cleared, field says 16
+  auto message = attach_failure_message([&] { (void)slick::queue<char>(shm("sq_marker_corrupt_unit")); });
   EXPECT_NE(message.find("disagrees with its items_per_slot field"), std::string::npos)
       << "actual: " << message;
 
-  slick::queue<char> plain(256, "sq_marker_corrupt_plain");
-  set_raw_marker("sq_marker_corrupt_plain", 0x534C5133u);  // bit set, field says 1
-  message = attach_failure_message([] { slick::queue<char>("sq_marker_corrupt_plain"); });
+  slick::queue<char> plain(256, shm("sq_marker_corrupt_plain"));
+  set_raw_marker(shm("sq_marker_corrupt_plain"), 0x534C5133u);  // bit set, field says 1
+  message = attach_failure_message([&] { (void)slick::queue<char>(shm("sq_marker_corrupt_plain")); });
   EXPECT_NE(message.find("disagrees with its items_per_slot field"), std::string::npos)
       << "actual: " << message;
 }
 
-TEST(ShmTests, UnknownMarkerBitStillRejected) {
+TEST_F(ShmTests, UnknownMarkerBitStillRejected) {
   // Bits 2-3 remain reserved, so a future feature fails as loudly for this build as
   // items_per_slot does for an older one.
-  slick::queue<char> creator(256, "sq_marker_unknown");
-  set_raw_marker("sq_marker_unknown", 0x534C5131u | 0x4u);
-  auto message = attach_failure_message([] { slick::queue<char>("sq_marker_unknown"); });
+  slick::queue<char> creator(256, shm("sq_marker_unknown"));
+  set_raw_marker(shm("sq_marker_unknown"), 0x534C5131u | 0x4u);
+  auto message = attach_failure_message([&] { (void)slick::queue<char>(shm("sq_marker_unknown")); });
   EXPECT_NE(message.find("unknown layout features"), std::string::npos) << "actual: " << message;
 }
 
@@ -523,12 +552,12 @@ struct alignas(32) wide_element {
 };
 }  // namespace
 
-TEST(ShmTests, ItemsPerSlotPadsDataArrayForOverAlignedT) {
+TEST_F(ShmTests, ItemsPerSlotPadsDataArrayForOverAlignedT) {
   // Regression: with one 16-byte control slot the data array started at offset 80, which
   // is not 32-byte aligned, so placement-new of an alignas(32) T was undefined behaviour.
-  slick::queue<wide_element> server(64, 64, "sq_ips_align");
+  slick::queue<wide_element> server(64, 64, shm("sq_ips_align"));
   ASSERT_EQ(server.slot_count(), 1u);
-  slick::queue<wide_element> client("sq_ips_align");
+  slick::queue<wide_element> client(shm("sq_ips_align"));
 
   // The ring holds a single unit, so each message is read before the next replaces it.
   uint64_t cursor = 0;
@@ -545,25 +574,25 @@ TEST(ShmTests, ItemsPerSlotPadsDataArrayForOverAlignedT) {
   }
 }
 
-TEST(ShmTests, MisalignedLegacyLayoutIsRefused) {
+TEST_F(ShmTests, MisalignedLegacyLayoutIsRefused) {
   // The default layout is kept byte-identical for older peers, so it is not padded; for
   // an over-aligned T in a one-item queue it would misplace the data array, which must
   // now be an error rather than undefined behaviour.
   auto message = attach_failure_message(
-      [] { slick::queue<wide_element>(1, "sq_ips_align_legacy"); });
+      [&] { (void)slick::queue<wide_element>(1, shm("sq_ips_align_legacy")); });
   EXPECT_NE(message.find("not aligned for alignof(T)"), std::string::npos)
       << "actual: " << message;
 
   // One item per slot and a queue large enough keeps the legacy layout and works.
-  EXPECT_NO_THROW({ slick::queue<wide_element> ok(2, "sq_ips_align_legacy_ok"); });
+  EXPECT_NO_THROW({ slick::queue<wide_element> ok(2, shm("sq_ips_align_legacy_ok")); });
 }
 
-TEST(ShmTests, ZeroItemsPerSlotInHeaderReadsAsOne) {
+TEST_F(ShmTests, ZeroItemsPerSlotInHeaderReadsAsOne) {
   // Segments created before the field existed left it zeroed. Simulate one by clearing
   // the field on a default segment, then attach both ways.
-  slick::queue<int> creator(8, "sq_items_per_slot_legacy");
+  slick::queue<int> creator(8, shm("sq_items_per_slot_legacy"));
   {
-    slick::shm::shared_memory raw("sq_items_per_slot_legacy", slick::shm::open_existing,
+    slick::shm::shared_memory raw(shm("sq_items_per_slot_legacy"), slick::shm::open_existing,
                                   slick::shm::access_mode::read_write);
     auto* base = static_cast<uint8_t*>(raw.data());
     ASSERT_NE(base, nullptr);
@@ -571,9 +600,9 @@ TEST(ShmTests, ZeroItemsPerSlotInHeaderReadsAsOne) {
     std::memcpy(base + 28, &zero, sizeof(zero));
   }
 
-  slick::queue<int> opener("sq_items_per_slot_legacy");
+  slick::queue<int> opener(shm("sq_items_per_slot_legacy"));
   EXPECT_EQ(opener.items_per_slot(), 1u);
-  EXPECT_NO_THROW({ slick::queue<int> again(8, "sq_items_per_slot_legacy"); });
+  EXPECT_NO_THROW({ slick::queue<int> again(8, shm("sq_items_per_slot_legacy")); });
 
   auto slot = creator.reserve();
   *creator[slot] = 11;
@@ -584,11 +613,11 @@ TEST(ShmTests, ZeroItemsPerSlotInHeaderReadsAsOne) {
   EXPECT_EQ(*read.first, 11);
 }
 
-TEST(ShmTests, MatchingReadLastOffTraitsShareSegment) {
+TEST_F(ShmTests, MatchingReadLastOffTraitsShareSegment) {
   // Both sides agree the index is not maintained, so the markers match and the segment
   // works normally through the cursor-based read path.
-  slick::queue<int, no_read_last_traits> creator(4, "sq_no_read_last");
-  slick::queue<int, no_read_last_traits> attacher("sq_no_read_last");
+  slick::queue<int, no_read_last_traits> creator(4, shm("sq_no_read_last"));
+  slick::queue<int, no_read_last_traits> attacher(shm("sq_no_read_last"));
   ASSERT_EQ(attacher.size(), 4u);
 
   auto slot = creator.reserve();
@@ -599,4 +628,61 @@ TEST(ShmTests, MatchingReadLastOffTraitsShareSegment) {
   auto read = attacher.read(cursor);
   ASSERT_NE(read.first, nullptr);
   EXPECT_EQ(*read.first, 7);
+}
+
+TEST_F(ShmTests, InitializerDestructionKeepsSegmentForSurvivingPeers) {
+  // Regression: the queue that initialized the segment unlinked its name on destruction.
+  // A peer still attached kept reading the orphaned mapping, while a restarted process
+  // silently created a fresh segment under the same name, so the two never met again.
+  auto initializer = std::make_unique<slick::queue<int>>(4, shm("sq_initializer_exit"));
+  ASSERT_TRUE(initializer->own_buffer());
+  slick::queue<int> survivor(shm("sq_initializer_exit"));
+
+  auto slot = initializer->reserve();
+  *(*initializer)[slot] = 42;
+  initializer->publish(slot);
+  initializer.reset();
+
+  // The restarted process must attach to the segment the survivor still maps.
+  slick::queue<int> restarted(4, shm("sq_initializer_exit"));
+  EXPECT_FALSE(restarted.own_buffer());
+  slot = restarted.reserve();
+  EXPECT_EQ(slot, 1u);
+  *restarted[slot] = 7;
+  restarted.publish(slot);
+
+  uint64_t cursor = 0;
+  auto read = survivor.read(cursor);
+  ASSERT_NE(read.first, nullptr);
+  EXPECT_EQ(*read.first, 42);
+  read = survivor.read(cursor);
+  ASSERT_NE(read.first, nullptr);
+  EXPECT_EQ(*read.first, 7);
+}
+
+TEST_F(ShmTests, RemoveShmUnlinksNameButKeepsMappings) {
+  slick::queue<int> local(4);
+  EXPECT_FALSE(local.remove_shm());
+
+  slick::queue<int> coordinator(4, shm("sq_remove_shm"));
+  slick::queue<int> peer(shm("sq_remove_shm"));
+  EXPECT_TRUE(coordinator.remove_shm());
+
+  // Mappings opened before the removal keep working.
+  auto slot = coordinator.reserve();
+  *coordinator[slot] = 5;
+  coordinator.publish(slot);
+  uint64_t cursor = 0;
+  auto read = peer.read(cursor);
+  ASSERT_NE(read.first, nullptr);
+  EXPECT_EQ(*read.first, 5);
+
+#if !defined(_WIN32)
+  // On POSIX the name is gone, so the next queue starts a fresh segment. Windows has no
+  // name to remove: the segment lives until its last handle closes.
+  EXPECT_FALSE(slick::shm::shared_memory::exists("sq_remove_shm"));
+  slick::queue<int> fresh(4, shm("sq_remove_shm"));
+  EXPECT_TRUE(fresh.own_buffer());
+  EXPECT_EQ(fresh.reserve(), 0u);
+#endif
 }

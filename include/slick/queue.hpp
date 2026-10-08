@@ -294,7 +294,7 @@ class SlickQueue {
     detail::loss_counter_storage<Traits::enable_loss_detection> loss_count_;
     slick::shm::shared_memory shm_;  // RAII wrapper for shared memory
     void* lpvMem_ = nullptr;          // Cached data pointer
-    std::string shm_name_;            // Stored for cleanup
+    std::string shm_name_;            // Stored for shm_name() and remove_shm()
 
     // Shared memory layout constants
     //
@@ -447,16 +447,13 @@ public:
     }
 
     virtual ~SlickQueue() noexcept {
-        if (use_shm_) {
-            // slick-shm RAII handles unmapping and closing automatically
-            // Only need to explicitly remove on POSIX if we're the owner
-#if !defined(_MSC_VER)
-            if (own_ && shm_.is_valid() && !shm_name_.empty()) {
-                slick::shm::shared_memory::remove(shm_name_.c_str());
-            }
-#endif
-            // shm_ destructor unmaps and closes handle automatically
-        } else {
+        // A shared segment is never unlinked here, even by the queue that initialized it.
+        // On POSIX the name outlives every mapping until shm_unlink(), so unlinking while a
+        // peer is still attached would orphan that peer on the old mapping while a restarted
+        // or late process silently creates a fresh segment under the same name. Removing
+        // the name is the coordinator's call, via remove_shm(), once every peer is done.
+        // shm_'s destructor unmaps and closes the handle.
+        if (!use_shm_) {
             delete[] data_;
             data_ = nullptr;
             delete[] control_;
@@ -481,6 +478,21 @@ public:
      * @return Name of the shared memory segment
      */
     const char* shm_name() const noexcept { return shm_name_.c_str(); }
+
+    /**
+     * @brief Remove the shared memory segment's name so later queues get a fresh segment
+     *
+     * The destructor never does this, because a peer may still be attached. Call it from the
+     * process that coordinates the queue's lifetime once no peer will attach again. Mappings
+     * that are already open, including this queue's own, stay valid until they are closed.
+     *
+     * @return true if the name was removed; false for a local-memory queue or if removal
+     *         failed. Always true for a shared queue on Windows, where the segment is freed
+     *         when its last handle closes and there is no name to remove.
+     */
+    bool remove_shm() const noexcept {
+        return use_shm_ && slick::shm::shared_memory::remove(shm_name_.c_str());
+    }
 
     /**
      * @brief Get the size of the queue
@@ -1045,7 +1057,7 @@ private:
     }
 
     void allocate_shm_data(const char* const shm_name, bool open_only) {
-        shm_name_ = shm_name;  // Store for destructor cleanup
+        shm_name_ = shm_name;  // Store for shm_name() and remove_shm()
 
         if (open_only) {
             // Opener constructor - open existing only
