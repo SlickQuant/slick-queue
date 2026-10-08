@@ -1,3 +1,14 @@
+# v2.3.0 - 2026-10-08
+
+## Shared-memory segment lifetime
+- Behaviour change: a queue no longer unlinks its shared-memory segment on destruction, not even the queue that created it. Previously the creator called `shm_unlink()` on POSIX when it was destroyed. A peer that was still attached kept reading the orphaned mapping, while a restarted or late process silently created a fresh segment under the same name, so the two never met again. A restarted process now reattaches to the existing segment and keeps its contents
+- New `remove_shm()` unlinks the segment's name so the next queue created with it starts fresh. Mappings that are already open, including the caller's own, stay valid. Call it from the process that coordinates the queue's lifetime once no peer will attach again. It returns `false` for a local-memory queue. On Windows it always returns `true` for a shared queue, because the segment is freed when its last handle closes
+- Migration: on POSIX, code that relied on the creator's destructor to clean up must now call `remove_shm()` (or `slick::shm::shared_memory::remove(name)`), or segments stay in `/dev/shm` until removed. Windows behaviour is unchanged
+
+## Tests
+- Shared-memory tests now use a fixture that unlinks each segment name before first use and again in `TearDown()`, so a crashed run can no longer leave stale segments for the next one
+- Added a regression test showing that a peer and a restarted creator still share one segment after the original creator is destroyed, and a `remove_shm()` test covering local queues, mappings that stay valid after removal, and a fresh segment afterwards on POSIX
+
 # v2.2.0 - 2026-10-07
 
 ## API

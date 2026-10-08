@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.10)
 
 project(slick-queue
-        VERSION 2.2.0
+        VERSION 2.3.0
         DESCRIPTION "A C++ Lock-Free MPMC queue"
         LANGUAGES CXX)
 
