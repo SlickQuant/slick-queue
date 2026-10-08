@@ -87,7 +87,7 @@ set(BUILD_SLICK_QUEUE_TESTS OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
     slick-queue
     GIT_REPOSITORY https://github.com/SlickQuant/slick-queue.git
-    GIT_TAG v2.1.0  # See https://github.com/SlickQuant/slick-queue/releases for latest version
+    GIT_TAG v2.2.0  # See https://github.com/SlickQuant/slick-queue/releases for latest version
 )
 FetchContent_MakeAvailable(slick-queue)
 
@@ -301,6 +301,8 @@ and remains fully compatible with older peers.
 - `uint32_t size()` - Get queue capacity
 - `uint32_t items_per_slot()` - Get the minimum number of items a single `reserve()` consumes
 - `uint32_t slot_count()` - Get the number of control slots, `size() / items_per_slot()`
+- `bool use_shm()` - Whether the queue lives in shared memory
+- `const char* shm_name()` - Get the shared-memory segment name (empty string for a local-memory queue)
 - `uint64_t loss_count() const` - Get count of skipped items due to overwrite (0 when the feature is off)
 - `void reset()` - Reset the queue, invalidating all existing data
 

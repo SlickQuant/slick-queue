@@ -1,3 +1,8 @@
+# v2.2.0 - 2026-10-07
+
+## API
+- New `shm_name()` accessor returns the name of the shared-memory segment the queue was created with or attached to, or an empty string for a local-memory queue
+
 # v2.1.0 - 2026-09-24
 
 ## Control slots can cover several items (`items_per_slot`)

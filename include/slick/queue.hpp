@@ -477,6 +477,12 @@ public:
     bool use_shm() const noexcept { return use_shm_; }
 
     /**
+     * @brief Get the name of the shared memory segment
+     * @return Name of the shared memory segment
+     */
+    const char* shm_name() const noexcept { return shm_name_.c_str(); }
+
+    /**
      * @brief Get the size of the queue
      * @return Size of the queue
      */
